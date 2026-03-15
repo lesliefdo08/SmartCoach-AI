@@ -1,0 +1,33 @@
+{
+  "shot_type": "cover_drive",
+  "joint_angles_mean": {
+    "left_elbow_angle": 93.4,
+    "right_elbow_angle": 119.6,
+    "left_knee_angle": 139.8,
+    "right_knee_angle": 151.2,
+    "left_shoulder_angle": 55.3,
+    "right_shoulder_angle": 73.5,
+    "hip_alignment": 6.8,
+    "spine_tilt": 11.9
+  },
+  "joint_angles_std": {
+    "left_elbow_angle": 6.5,
+    "right_elbow_angle": 7.1,
+    "left_knee_angle": 5.9,
+    "right_knee_angle": 6.2,
+    "left_shoulder_angle": 5.4,
+    "right_shoulder_angle": 6.0,
+    "hip_alignment": 2.4,
+    "spine_tilt": 2.8
+  },
+  "ideal_ranges": {
+    "left_elbow_angle": [83.65, 103.15],
+    "right_elbow_angle": [108.95, 130.25],
+    "left_knee_angle": [130.95, 148.65],
+    "right_knee_angle": [141.9, 160.5],
+    "left_shoulder_angle": [47.2, 63.4],
+    "right_shoulder_angle": [64.5, 82.5],
+    "hip_alignment": [3.2, 10.4],
+    "spine_tilt": [7.7, 16.1]
+  }
+}

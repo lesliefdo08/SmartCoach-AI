@@ -1,0 +1,33 @@
+{
+  "shot_type": "pull_shot",
+  "joint_angles_mean": {
+    "left_elbow_angle": 86.7,
+    "right_elbow_angle": 112.5,
+    "left_knee_angle": 132.9,
+    "right_knee_angle": 146.3,
+    "left_shoulder_angle": 66.8,
+    "right_shoulder_angle": 84.1,
+    "hip_alignment": 10.7,
+    "spine_tilt": 16.5
+  },
+  "joint_angles_std": {
+    "left_elbow_angle": 6.8,
+    "right_elbow_angle": 7.3,
+    "left_knee_angle": 6.2,
+    "right_knee_angle": 6.6,
+    "left_shoulder_angle": 5.8,
+    "right_shoulder_angle": 6.5,
+    "hip_alignment": 2.8,
+    "spine_tilt": 3.0
+  },
+  "ideal_ranges": {
+    "left_elbow_angle": [76.5, 96.9],
+    "right_elbow_angle": [101.55, 123.45],
+    "left_knee_angle": [123.6, 142.2],
+    "right_knee_angle": [136.4, 156.2],
+    "left_shoulder_angle": [58.1, 75.5],
+    "right_shoulder_angle": [74.35, 93.85],
+    "hip_alignment": [6.5, 14.9],
+    "spine_tilt": [12.0, 21.0]
+  }
+}

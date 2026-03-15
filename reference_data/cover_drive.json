@@ -1,0 +1,13 @@
+{
+  "shot_type": "cover_drive",
+  "angles": {
+    "left_elbow_angle": 92.0,
+    "right_elbow_angle": 118.0,
+    "left_knee_angle": 138.0,
+    "right_knee_angle": 152.0,
+    "left_shoulder_angle": 54.0,
+    "right_shoulder_angle": 72.0,
+    "hip_alignment": 6.0,
+    "spine_tilt": 11.0
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "shot_type": "defense",
+  "angles": {
+    "left_elbow_angle": 104.0,
+    "right_elbow_angle": 124.0,
+    "left_knee_angle": 148.0,
+    "right_knee_angle": 154.0,
+    "left_shoulder_angle": 48.0,
+    "right_shoulder_angle": 62.0,
+    "hip_alignment": 3.0,
+    "spine_tilt": 7.0
+  }
+}

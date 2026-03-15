@@ -1,0 +1,13 @@
+{
+  "shot_type": "pull_shot",
+  "angles": {
+    "left_elbow_angle": 86.0,
+    "right_elbow_angle": 112.0,
+    "left_knee_angle": 132.0,
+    "right_knee_angle": 146.0,
+    "left_shoulder_angle": 66.0,
+    "right_shoulder_angle": 84.0,
+    "hip_alignment": 10.0,
+    "spine_tilt": 16.0
+  }
+}
