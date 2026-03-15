@@ -120,3 +120,85 @@ def compute_motion_series(landmark_series: List[Dict[str, Keypoint]]) -> List[Di
         )
 
     return metrics
+
+
+def _angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    ab = a - b
+    cb = c - b
+    denom = float(np.linalg.norm(ab) * np.linalg.norm(cb))
+    if denom < 1e-8:
+        return 0.0
+    cos_v = float(np.clip(np.dot(ab, cb) / denom, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cos_v)))
+
+
+def compute_pose_biomechanics(keypoints: Dict[str, Keypoint], bat_center: tuple[int, int] | None = None) -> Dict[str, float]:
+    if not keypoints:
+        return {
+            "elbow_angle": 0.0,
+            "knee_bend": 0.0,
+            "torso_tilt": 0.0,
+            "head_alignment": 0.0,
+            "bat_arm_alignment": 0.0,
+            "follow_through_height": 0.0,
+            "body_rotation": 0.0,
+            "head_position": 0.0,
+        }
+
+    l_sh = np.array(keypoints["left_shoulder"][:2], dtype=np.float32)
+    r_sh = np.array(keypoints["right_shoulder"][:2], dtype=np.float32)
+    l_el = np.array(keypoints["left_elbow"][:2], dtype=np.float32)
+    r_el = np.array(keypoints["right_elbow"][:2], dtype=np.float32)
+    l_wr = np.array(keypoints["left_wrist"][:2], dtype=np.float32)
+    r_wr = np.array(keypoints["right_wrist"][:2], dtype=np.float32)
+    l_hip = np.array(keypoints["left_hip"][:2], dtype=np.float32)
+    r_hip = np.array(keypoints["right_hip"][:2], dtype=np.float32)
+    l_kn = np.array(keypoints["left_knee"][:2], dtype=np.float32)
+    r_kn = np.array(keypoints["right_knee"][:2], dtype=np.float32)
+    l_an = np.array(keypoints["left_ankle"][:2], dtype=np.float32)
+    r_an = np.array(keypoints["right_ankle"][:2], dtype=np.float32)
+    head = np.array(keypoints["nose"][:2], dtype=np.float32)
+
+    left_elbow = _angle(l_sh, l_el, l_wr)
+    right_elbow = _angle(r_sh, r_el, r_wr)
+    elbow_angle = float((left_elbow + right_elbow) / 2.0)
+
+    left_knee = _angle(l_hip, l_kn, l_an)
+    right_knee = _angle(r_hip, r_kn, r_an)
+    knee_bend = float((left_knee + right_knee) / 2.0)
+
+    hip_center = (l_hip + r_hip) / 2.0
+    dx = float(abs(head[0] - hip_center[0]))
+    dy = float(abs(head[1] - hip_center[1])) + 1e-6
+    torso_tilt = float(np.degrees(np.arctan2(dx, dy)))
+
+    shoulder_vec = r_sh - l_sh
+    body_rotation = float(abs(np.degrees(np.arctan2(shoulder_vec[1], shoulder_vec[0]))))
+
+    head_alignment = float(abs(head[0] - hip_center[0]))
+    head_position = float(head_alignment)
+
+    wr_center = (l_wr + r_wr) / 2.0
+    sh_center = (l_sh + r_sh) / 2.0
+    arm_vec = wr_center - sh_center
+    arm_angle = float(np.degrees(np.arctan2(-arm_vec[1], arm_vec[0])))
+    bat_arm_alignment = 0.0
+    if bat_center is not None:
+        bat_vec = np.array([float(bat_center[0]) - sh_center[0], float(bat_center[1]) - sh_center[1]], dtype=np.float32)
+        bat_angle = float(np.degrees(np.arctan2(-bat_vec[1], bat_vec[0])))
+        bat_arm_alignment = float(180.0 - abs(bat_angle - arm_angle))
+    else:
+        bat_arm_alignment = float(180.0 - abs(arm_angle))
+
+    follow_through_height = float((sh_center[1] - wr_center[1]) / (abs(sh_center[1]) + 1e-6))
+
+    return {
+        "elbow_angle": round(elbow_angle, 3),
+        "knee_bend": round(knee_bend, 3),
+        "torso_tilt": round(torso_tilt, 3),
+        "head_alignment": round(head_alignment, 3),
+        "bat_arm_alignment": round(float(np.clip(bat_arm_alignment, 0.0, 180.0)), 3),
+        "follow_through_height": round(follow_through_height, 3),
+        "body_rotation": round(body_rotation, 3),
+        "head_position": round(head_position, 3),
+    }

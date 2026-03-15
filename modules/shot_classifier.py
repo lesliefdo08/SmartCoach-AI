@@ -1,156 +1,153 @@
 from __future__ import annotations
 
-from collections import Counter
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
 
+import joblib
 import numpy as np
+from sklearn.ensemble import RandomForestClassifier
 
 
-def _window_features(window: List[Dict[str, float]]) -> Dict[str, float]:
-    keys = window[0].keys()
-    out: Dict[str, float] = {}
-    for key in keys:
-        vals = np.array([float(item.get(key, 0.0)) for item in window], dtype=np.float32)
-        out[key] = float(np.mean(vals))
-    out["arc_total"] = float(np.sum([w["bat_swing_arc"] for w in window]))
+LABELS = ["defensive", "drive", "lofted", "pull", "cut", "sweep"]
+FEATURE_ORDER = [
+    "bat_swing_arc",
+    "bat_angle",
+    "follow_through_height",
+    "body_rotation",
+    "knee_bend",
+    "head_position",
+    "bat_velocity",
+    "ball_direction",
+]
+
+
+def _window_average(series: Sequence[Dict[str, float]], window_size: int = 15) -> List[Dict[str, float]]:
+    if not series:
+        return []
+    win = int(np.clip(window_size, 10, 20))
+    if len(series) < win:
+        return [
+            {
+                key: float(np.mean([s.get(key, 0.0) for s in series]))
+                for key in FEATURE_ORDER
+            }
+        ]
+    out: List[Dict[str, float]] = []
+    for i in range(0, len(series) - win + 1):
+        chunk = series[i : i + win]
+        out.append({key: float(np.mean([s.get(key, 0.0) for s in chunk])) for key in FEATURE_ORDER})
     return out
 
 
-def _classify_window(w: Dict[str, float]) -> tuple[str, float, str]:
-    # Defensive shot
-    if (
-        w["arc_total"] < 95.0
-        and abs(w["bat_angle"]) > 55.0
-        and w["body_lean"] < 11.0
-        and abs(w["follow_dx"]) < 10.0
-        and abs(w["follow_dy"]) < 10.0
-    ):
-        return "defense", 82.0, "Compact vertical bat path and short follow-through indicate a defensive intent."
-
-    # Drive
-    if (
-        95.0 <= w["arc_total"] <= 220.0
-        and w["follow_dx"] > 3.0
-        and 8.0 <= w["body_lean"] <= 22.0
-        and w["horizontal_ratio"] < 1.8
-    ):
-        return "drive", 78.0, "Forward follow-through with controlled arc indicates a drive pattern."
-
-    # Lofted shot
-    if (
-        w["arc_total"] > 210.0
-        and w["upward_ratio"] > 1.1
-        and w["wrist_height_norm"] > 0.08
-        and w["wrist_velocity"] > 8.0
-    ):
-        return "lofted_shot", 86.0, "High wrist extension and upward follow-through suggest an attempted lofted shot."
-
-    # Cut / pull
-    if (
-        w["horizontal_ratio"] >= 1.8
-        and w["shoulder_rotation"] > 12.0
-        and abs(w["follow_dx"]) > 8.0
-    ):
-        return "cut_pull", 80.0, "Horizontal bat travel with shoulder rotation indicates a cut/pull profile."
-
-    return "uncertain", 42.0, "Shot pattern is mixed across this temporal segment."
+def _vectorize(features: Dict[str, float]) -> np.ndarray:
+    return np.array([float(features.get(k, 0.0)) for k in FEATURE_ORDER], dtype=np.float32)
 
 
-def classify_shot_temporal(
-    motion_series: List[Dict[str, float]],
-    window_size: int = 15,
-) -> Dict[str, object]:
-    if not motion_series:
+def train_classifier(training_x: np.ndarray, training_y: np.ndarray, random_state: int = 42) -> Dict[str, object]:
+    clf = RandomForestClassifier(
+        n_estimators=500,
+        max_depth=None,
+        min_samples_split=3,
+        min_samples_leaf=1,
+        class_weight="balanced_subsample",
+        random_state=random_state,
+        n_jobs=-1,
+    )
+    clf.fit(training_x, training_y)
+    return {
+        "model": clf,
+        "labels": LABELS,
+        "feature_order": FEATURE_ORDER,
+    }
+
+
+def save_classifier(bundle: Dict[str, object], model_path: str | Path) -> None:
+    path = Path(model_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(bundle, path)
+
+
+def load_classifier(model_path: str | Path) -> Dict[str, object]:
+    return joblib.load(Path(model_path))
+
+
+def classify_shot_ml(feature_series: Sequence[Dict[str, float]], model_bundle: Dict[str, object], window_size: int = 15) -> Dict[str, object]:
+    windows = _window_average(feature_series, window_size=window_size)
+    if not windows:
         return {
-            "shot_type": "Uncertain Shot – Needs Review",
+            "shot_type": "Uncertain shot",
             "confidence_score": 0.0,
             "probabilities": {},
-            "insight": "Insufficient motion frames for temporal classification.",
+            "insight": "Insufficient frame features for classification.",
         }
 
-    win = int(np.clip(window_size, 10, 20))
-    if len(motion_series) < win:
-        win = max(3, len(motion_series))
+    model: RandomForestClassifier = model_bundle["model"]
+    labels = list(model_bundle.get("labels", LABELS))
 
-    window_votes: List[str] = []
-    confidences: List[float] = []
-    insights: List[str] = []
+    probabilities = []
+    for w in windows:
+        vec = _vectorize(w).reshape(1, -1)
+        probabilities.append(model.predict_proba(vec)[0])
 
-    for start in range(0, len(motion_series) - win + 1):
-        window = motion_series[start : start + win]
-        summary = _window_features(window)
-        label, conf, insight = _classify_window(summary)
-        window_votes.append(label)
-        confidences.append(conf)
-        insights.append(insight)
+    avg_proba = np.mean(np.vstack(probabilities), axis=0)
+    best_idx = int(np.argmax(avg_proba))
+    best_label = model.classes_[best_idx]
+    confidence = float(avg_proba[best_idx])
 
-    if not window_votes:
-        summary = _window_features(motion_series)
-        label, conf, insight = _classify_window(summary)
-        window_votes = [label]
-        confidences = [conf]
-        insights = [insight]
-
-    counts = Counter(window_votes)
-    total = len(window_votes)
-    winner, vote_count = counts.most_common(1)[0]
-    vote_ratio = vote_count / max(total, 1)
-
-    label_conf = float(np.mean([c for v, c in zip(window_votes, confidences) if v == winner]))
-    margin = 0.0
-    if len(counts) > 1:
-        margin = (vote_count - counts.most_common(2)[1][1]) / max(total, 1)
-    final_conf = float(np.clip((label_conf * 0.65) + (vote_ratio * 100.0 * 0.25) + (margin * 100.0 * 0.10), 0.0, 100.0))
-
-    probability_map = {
-        k: round((v / total) * 100.0, 2)
-        for k, v in sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
-    }
-
-    if final_conf < 50.0 or winner == "uncertain":
+    probability_map = {str(model.classes_[i]): round(float(avg_proba[i]) * 100.0, 2) for i in range(len(avg_proba))}
+    if confidence < 0.5:
         return {
-            "shot_type": "Uncertain Shot – Needs Review",
-            "confidence_score": round(final_conf, 2),
+            "shot_type": "Uncertain shot",
+            "confidence_score": round(confidence * 100.0, 2),
             "probabilities": probability_map,
-            "insight": "Temporal evidence is inconsistent. Review footwork, bat plane, and follow-through continuity.",
+            "insight": "Model confidence below 50%. Try clearer camera angle and complete follow-through.",
         }
 
-    insight_pool = [i for v, i in zip(window_votes, insights) if v == winner]
-    selected_insight = insight_pool[0] if insight_pool else "Shot dynamics were stable over multiple frame windows."
+    insight = {
+        "defensive": "Compact bat path and controlled body posture suggest a defensive shot.",
+        "drive": "Forward extension and stable transfer indicate a drive.",
+        "lofted": "High follow-through and upward bat path indicate a lofted shot attempt.",
+        "pull": "Horizontal bat travel with torso rotation aligns with a pull shot.",
+        "cut": "Lateral bat path with open shoulders suggests a cut shot.",
+        "sweep": "Low stance and across-line bat movement indicate a sweep.",
+    }.get(str(best_label), "Shot classified from temporal pose and object features.")
 
     return {
-        "shot_type": winner,
-        "confidence_score": round(final_conf, 2),
+        "shot_type": str(best_label),
+        "confidence_score": round(confidence * 100.0, 2),
         "probabilities": probability_map,
-        "insight": selected_insight,
+        "insight": insight,
     }
 
 
-def generate_contextual_feedback(
-    classification: Dict[str, object],
-    biomech_scores: Dict[str, float],
-    motion_series: List[Dict[str, float]],
-) -> str:
-    shot = str(classification.get("shot_type", "Uncertain Shot – Needs Review"))
+def generate_contextual_feedback(classification: Dict[str, object], biomech_scores: Dict[str, float], feature_series: Sequence[Dict[str, float]]) -> str:
+    shot = str(classification.get("shot_type", "Uncertain shot"))
     confidence = float(classification.get("confidence_score", 0.0))
-    insight = str(classification.get("insight", ""))
-
-    if not motion_series:
-        return "Pose continuity was low. Re-record from a side-on view with full body visibility."
-
-    avg_body_lean = float(np.mean([m["body_lean"] for m in motion_series]))
-    avg_upward = float(np.mean([m["upward_ratio"] for m in motion_series]))
-
-    balance = float(biomech_scores.get("balance_score", 0.0))
     technique = float(biomech_scores.get("technique_score", 0.0))
+    balance = float(biomech_scores.get("balance_score", 0.0))
 
-    if "lofted" in shot and balance < 65.0:
-        return f"{insight} Follow-through height indicates an attempted lofted shot, but balance was lost near impact. Keep head stable and reduce excessive spine drift."
-    if "drive" in shot and avg_body_lean > 20.0:
-        return f"{insight} Drive intent is clear, but forward lean is high. Transfer weight through the front leg without collapsing the torso."
-    if "defense" in shot and technique < 70.0:
-        return f"{insight} Defensive setup is present; tighten elbow structure and keep bat closer to the pad line."
-    if "cut_pull" in shot and avg_upward > 1.0:
-        return f"{insight} Side-on shot mechanics are present; avoid lifting too early and keep the bat path flatter through contact."
+    if shot == "Uncertain shot":
+        return "Shot classification is uncertain. Capture more side-on frames through full impact and follow-through."
 
-    return f"{insight} Shot recognized at {confidence:.1f}% confidence with stable biomechanics."
+    if not feature_series:
+        return f"Detected {shot} at {confidence:.1f}% confidence."
+
+    avg_follow = float(np.mean([f.get("follow_through_height", 0.0) for f in feature_series]))
+    avg_head = float(np.mean([f.get("head_position", 0.0) for f in feature_series]))
+
+    if shot == "lofted" and balance < 65.0:
+        return "Follow-through height indicates an attempted lofted shot, but balance was lost at impact. Stabilize head position and front-leg base."
+    if shot == "drive" and technique < 70.0:
+        return "Drive intent is clear, but bat-arm alignment is inconsistent. Keep elbow lead and maintain straighter bat path through contact."
+    if shot in {"pull", "cut"} and avg_head > 35.0:
+        return "Horizontal shot mechanics are present, but head movement is high. Keep head quieter to improve timing and control."
+    if shot == "sweep" and avg_follow < 0.1:
+        return "Sweep setup is detected, but follow-through is short. Extend through the line for better control."
+
+    return f"{shot.title()} classified at {confidence:.1f}% confidence with stable biomechanics signals."
+
+
+def build_training_matrices(samples: Sequence[Tuple[Dict[str, float], str]]) -> tuple[np.ndarray, np.ndarray]:
+    x = np.array([_vectorize(features) for features, _ in samples], dtype=np.float32)
+    y = np.array([label for _, label in samples])
+    return x, y

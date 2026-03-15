@@ -1,6 +1,7 @@
 streamlit
 opencv-python-headless
 mediapipe
+ultralytics
 numpy
 pandas
 matplotlib
@@ -8,3 +9,4 @@ seaborn
 scikit-learn
 protobuf<4
 bcrypt
+joblib

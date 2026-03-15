@@ -83,12 +83,22 @@ def summarize_biomechanics(metrics_series: List[Dict[str, float]]) -> Dict[str, 
     spine_vals = np.array([m["spine_tilt"] for m in metrics_series], dtype=np.float32)
     head_vals = np.array([m["head_position_relative_ball_line"] for m in metrics_series], dtype=np.float32)
 
-    technique = 0.45 * _score_from_target(float(np.mean(elbow_vals)), target=105.0, tolerance=45.0)
-    technique += 0.35 * _score_from_target(float(np.mean(knee_vals)), target=145.0, tolerance=40.0)
-    technique += 0.20 * _score_from_target(float(np.mean(spine_vals)), target=12.0, tolerance=15.0)
+    # Derived control factors
+    head_stability = float(np.clip(100.0 - np.std(head_vals) * 1.8, 0.0, 100.0))
+    knee_control = _score_from_target(float(np.mean(knee_vals)), target=145.0, tolerance=38.0)
+    body_balance = _score_from_target(float(np.mean(spine_vals)), target=10.0, tolerance=14.0)
 
-    balance = 0.6 * _score_from_target(float(np.mean(spine_vals)), target=10.0, tolerance=14.0)
-    balance += 0.4 * _score_from_target(float(np.mean(head_vals)), target=35.0, tolerance=50.0)
+    bat_alignment_proxy = _score_from_target(float(np.mean(elbow_vals)), target=108.0, tolerance=40.0)
+    follow_through_control = float(np.clip(100.0 - np.std(elbow_vals) * 1.5, 0.0, 100.0))
+
+    technique = 0.30 * bat_alignment_proxy
+    technique += 0.25 * knee_control
+    technique += 0.20 * _score_from_target(float(np.mean(spine_vals)), target=12.0, tolerance=15.0)
+    technique += 0.25 * follow_through_control
+
+    balance = 0.45 * body_balance
+    balance += 0.35 * _score_from_target(float(np.mean(head_vals)), target=35.0, tolerance=50.0)
+    balance += 0.20 * head_stability
 
     spread = float(np.mean([np.std(elbow_vals), np.std(knee_vals), np.std(spine_vals), np.std(head_vals)]))
     consistency = float(np.clip(100.0 - spread * 1.2, 0.0, 100.0))

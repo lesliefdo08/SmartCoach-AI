@@ -53,7 +53,15 @@ from core.video_processor import extract_frames, load_video
 from database.database import init_database
 from modules.biomechanics import compute_biomechanics_frame, summarize_biomechanics
 from modules.session_manager import fetch_user_sessions, save_analysis_session
-from modules.shot_classifier import classify_shot_temporal, generate_contextual_feedback
+from modules.shot_classifier import (
+    build_training_matrices,
+    classify_shot_ml,
+    generate_contextual_feedback,
+    load_classifier,
+    save_classifier,
+    train_classifier,
+)
+from modules.video_processor import CricketAnalyticsPipeline
 from ui.dashboard import render_user_dashboard
 from ui.login import render_login
 from ui.signup import render_signup
@@ -67,7 +75,7 @@ from utils.visualization import (
 
 ROOT_DIR = Path(__file__).parent
 REFERENCE_DIR = ROOT_DIR / "reference_data"
-MODEL_PATH = ROOT_DIR / "assets" / "shot_classifier.pkl"
+MODEL_PATH = ROOT_DIR / "models" / "shot_classifier.pkl"
 MISTAKE_MODEL_PATH = ROOT_DIR / "assets" / "mistake_detector.pkl"
 
 
@@ -120,23 +128,36 @@ def _aggregate_features(frame_results: List[Dict[str, object]]) -> Dict[str, flo
 
 def _load_or_train_shot_model() -> Dict[str, object]:
     if MODEL_PATH.exists():
-        return load_model(MODEL_PATH)
+        return load_classifier(MODEL_PATH)
 
-    reference_profiles = load_reference_profiles(REFERENCE_DIR)
-    sequences, labels = generate_synthetic_training_data(
-        reference_profiles=reference_profiles,
-        samples_per_class=220,
-        min_seq_len=18,
-        max_seq_len=40,
-        random_state=42,
-    )
-    bundle = train_model(
-        sequences=sequences,
-        labels=labels,
-        model_type="random_forest",
-        random_state=42,
-    )
-    save_model(bundle, MODEL_PATH)
+    rng = np.random.default_rng(42)
+    priors = {
+        "defensive": [80, 68, 0.05, 6, 155, 20, 4, 15],
+        "drive": [130, 42, 0.12, 12, 145, 26, 7, 20],
+        "lofted": [220, 18, 0.20, 14, 140, 34, 11, 35],
+        "pull": [170, 5, 0.09, 20, 135, 30, 10, -5],
+        "cut": [160, -8, 0.08, 22, 138, 28, 9, -20],
+        "sweep": [145, -28, 0.06, 16, 122, 24, 8, -40],
+    }
+    keys = [
+        "bat_swing_arc",
+        "bat_angle",
+        "follow_through_height",
+        "body_rotation",
+        "knee_bend",
+        "head_position",
+        "bat_velocity",
+        "ball_direction",
+    ]
+    samples = []
+    for label, base in priors.items():
+        for _ in range(280):
+            vals = rng.normal(loc=np.array(base, dtype=np.float32), scale=np.array([12, 10, 0.04, 5, 10, 8, 2, 10], dtype=np.float32))
+            samples.append(({k: float(v) for k, v in zip(keys, vals)}, label))
+
+    x, y = build_training_matrices(samples)
+    bundle = train_classifier(x, y)
+    save_classifier(bundle, MODEL_PATH)
     return bundle
 
 
@@ -276,209 +297,139 @@ def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_n
         return None
 
     try:
-        with st.spinner("Loading video..."):
-            cap = load_video(temp_path)
-            frames, fps = extract_frames(cap, sample_rate=sample_rate)
-            cap.release()
+        shot_model = _load_or_train_shot_model()
+        pipeline = CricketAnalyticsPipeline(sample_rate=sample_rate, target_size=(854, 480))
+        out = pipeline.process_video(temp_path)
+        pipeline.close()
     except Exception as exc:
-        st.error(f"Video loading failed: {exc}")
+        st.error(f"Pipeline execution failed: {exc}")
         return None
 
-    if not frames:
-        st.error("No frames could be extracted from the uploaded video.")
+    frame_data = out.get("frame_data", [])
+    if not frame_data:
+        st.warning("No valid frames were analyzed.")
         return None
 
-    pipeline = FramePipeline(target_size=(854, 480))
-    comparator = PoseComparator()
-
-    pose_entries: List[Dict[str, object]] = []
-    keypoint_series: List[Dict[str, tuple[float, float, float]]] = []
-    motion_series: List[Dict[str, float]] = []
-    biomechanics_series: List[Dict[str, float]] = []
-    display_candidates: List[Dict[str, object]] = []
-    resized_frames: List[np.ndarray] = []
-    torso_rotation_series: List[float] = []
-    bat_plane_series: List[float] = []
-    advanced_projection_frames: List[np.ndarray] = []
-    bat_tips: List[tuple[int, int]] = []
-    ball_centers: List[tuple[int, int]] = []
-    previous_pose: Dict[str, object] = {}
-
-    progress = st.progress(0, text="Analyzing frames...")
-    total = len(frames)
-
-    for idx, frame in enumerate(frames, start=1):
-        run_pose_this_frame = (idx % 2 == 0)
-        shared = pipeline.process_frame(frame, previous_pose=previous_pose, run_pose=run_pose_this_frame)
-
-        frame_bgr_small = shared["frame_bgr"]
-        resized_frames.append(frame_bgr_small)
-        keypoints = shared["pose_landmarks"]
-        features = shared["pose_features"]
-        pose3d = shared.get("pose3d", {})
-
-        previous_pose = {
-            "pose_landmarks": keypoints,
-            "pose3d": pose3d,
-            "confidence": shared.get("pose_confidence", 0.0),
-        }
-
-        bat_det = shared.get("bat_detection", {})
-        if bat_det.get("tip") is not None:
-            bat_tips.append(bat_det["tip"])
-
-        ball_det = shared.get("ball_detection", {})
-        if ball_det.get("center") is not None:
-            ball_centers.append(ball_det["center"])
-
-        bio3d = shared.get("biomechanics", {})
-        torso_rotation_series.append(float(bio3d.get("torso_twist", 0.0)))
-        bat_plane_series.append(float(bio3d.get("bat_swing_plane_angle", 0.0)))
-        if pose3d and len(advanced_projection_frames) < 8 and idx % max(1, total // 8) == 0:
-            advanced_projection_frames.append(draw_3d_skeleton_projection(frame_bgr_small, pose3d))
-
-        if not keypoints:
-            progress.progress(int((idx / total) * 100), text=f"Analyzing frames... {idx}/{total}")
-            continue
-
-        keypoint_series.append(keypoints)
-        if len(keypoint_series) >= 2:
-            prev = keypoint_series[-2]
-            curr = keypoint_series[-1]
-
-            lw_prev = np.array(prev["left_wrist"][:2], dtype=np.float32)
-            rw_prev = np.array(prev["right_wrist"][:2], dtype=np.float32)
-            lw_curr = np.array(curr["left_wrist"][:2], dtype=np.float32)
-            rw_curr = np.array(curr["right_wrist"][:2], dtype=np.float32)
-            sh_prev = (np.array(prev["left_shoulder"][:2]) + np.array(prev["right_shoulder"][:2])) / 2.0
-            sh_curr = (np.array(curr["left_shoulder"][:2]) + np.array(curr["right_shoulder"][:2])) / 2.0
-            wr_prev = (lw_prev + rw_prev) / 2.0
-            wr_curr = (lw_curr + rw_curr) / 2.0
-
-            vec_prev = wr_prev - sh_prev
-            vec_curr = wr_curr - sh_curr
-            bat_angle_prev = float(np.degrees(np.arctan2(-vec_prev[1], vec_prev[0])))
-            bat_angle_curr = float(np.degrees(np.arctan2(-vec_curr[1], vec_curr[0])))
-            follow_dx = float(wr_curr[0] - wr_prev[0])
-            follow_dy = float(wr_curr[1] - wr_prev[1])
-            body_lean = float(
-                np.degrees(
-                    np.arctan2(
-                        abs(curr["nose"][0] - ((curr["left_hip"][0] + curr["right_hip"][0]) / 2.0)),
-                        abs(curr["nose"][1] - ((curr["left_hip"][1] + curr["right_hip"][1]) / 2.0)) + 1e-6,
-                    )
-                )
-            )
-            shoulder_vec = np.array(curr["right_shoulder"][:2]) - np.array(curr["left_shoulder"][:2])
-            motion_series.append(
-                {
-                    "bat_swing_arc": abs(bat_angle_curr - bat_angle_prev),
-                    "wrist_velocity": float((np.linalg.norm(lw_curr - lw_prev) + np.linalg.norm(rw_curr - rw_prev)) / 2.0),
-                    "body_lean": body_lean,
-                    "follow_dx": follow_dx,
-                    "follow_dy": follow_dy,
-                    "horizontal_ratio": abs(follow_dx) / (abs(follow_dy) + 1e-6),
-                    "upward_ratio": max(0.0, -follow_dy) / (abs(follow_dx) + 1e-6),
-                    "wrist_height_norm": float((sh_curr[1] - wr_curr[1]) / (abs(sh_curr[1]) + 1e-6)),
-                    "bat_angle": bat_angle_curr,
-                    "shoulder_rotation": float(abs(np.degrees(np.arctan2(shoulder_vec[1], shoulder_vec[0])))),
-                }
-            )
-
-        ball_line_x = float(ball_det["center"][0]) if ball_det.get("center") is not None else float(frame_bgr_small.shape[1]) / 2.0
-        biomechanics_series.append(compute_biomechanics_frame(keypoints=keypoints, ball_line_x=ball_line_x))
-
-        pose_entries.append(
-            {
-                "frame_index": idx,
-                "features": features,
-            }
-        )
-
-        if len(display_candidates) < 8 and idx % max(1, total // 8) == 0:
-            display_candidates.append(
-                {
-                    "frame_rgb": cv2.cvtColor(frame_bgr_small, cv2.COLOR_BGR2RGB),
-                    "keypoints": keypoints,
-                    "features": features,
-                }
-            )
-
-        progress.progress(int((idx / total) * 100), text=f"Analyzing frames... {idx}/{total}")
-
-    pipeline.close()
-    progress.empty()
-
-    if not pose_entries:
-        st.warning("No valid poses detected. Try a clearer side-view cricket clip.")
-        return None
-
-    bat_tracking = _build_bat_tracking_from_path(bat_tips)
-    ball_tracking = _build_ball_tracking_from_path(ball_centers, bat_tracking.get("smoothed_bat_path", []))
-
-    shot_prediction = classify_shot_temporal(motion_series, window_size=15)
-    raw_shot = str(shot_prediction["shot_type"])
-    detected_shot = raw_shot.lower().replace(" ", "_")
-    confidence_score = float(shot_prediction["confidence_score"])
+    shot_prediction = classify_shot_ml(out.get("window_features", []), shot_model, window_size=15)
+    raw_shot = str(shot_prediction.get("shot_type", "Uncertain shot"))
+    confidence_score = float(shot_prediction.get("confidence_score", 0.0))
     reference_key_map = {
-        "defense": "defense",
+        "defensive": "defense",
         "drive": "cover_drive",
-        "lofted_shot": "straight_drive",
-        "cut_pull": "pull_shot",
+        "lofted": "straight_drive",
+        "pull": "pull_shot",
+        "cut": "pull_shot",
+        "sweep": "defense",
     }
-    reference_shot = reference_key_map.get(detected_shot, "defense")
+    reference_shot = reference_key_map.get(raw_shot.lower(), "defense")
+
     try:
         reference_profile = _load_reference_profile(reference_shot)
     except Exception as exc:
         st.error(f"Reference profile loading failed: {exc}")
         return None
+
     reference_features = get_reference_means(reference_profile)
+    comparator = PoseComparator()
 
     frame_results: List[Dict[str, object]] = []
-    for entry in pose_entries:
-        comparison = comparator.compare(entry["features"], reference_profile)
+    biomechanics_series: List[Dict[str, float]] = []
+    display_frames: List[np.ndarray] = []
+    advanced_projection_frames: List[np.ndarray] = []
+
+    for i, row in enumerate(frame_data, start=1):
+        features = row.get("features", {})
+        if not features:
+            continue
+        comparison = comparator.compare(features, reference_profile)
         frame_results.append(
             {
-                "frame_index": entry["frame_index"],
-                "features": entry["features"],
+                "frame_index": int(row["frame_index"]),
+                "features": features,
                 "similarity_score": comparison["similarity_score"],
                 "comparison": comparison,
             }
         )
 
-    display_frames: List[np.ndarray] = []
-    for sample in display_candidates:
-        comparison = comparator.compare(sample["features"], reference_profile)
-        frame_bgr = cv2.cvtColor(sample["frame_rgb"], cv2.COLOR_RGB2BGR)
-        overlay = draw_pose_overlay(
-            frame_bgr=frame_bgr,
-            keypoints=sample["keypoints"],
-            joint_errors=comparison["joint_errors"],
-            angles=sample["features"],
-        )
-        display_frames.append(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+        pose_metrics = row.get("pose_features", {})
+        if pose_metrics:
+            biomechanics_series.append(
+                {
+                    "elbow_angle": float(pose_metrics.get("elbow_angle", 0.0)),
+                    "knee_bend_angle": float(pose_metrics.get("knee_bend", 0.0)),
+                    "spine_tilt": float(pose_metrics.get("torso_tilt", 0.0)),
+                    "head_position_relative_ball_line": float(pose_metrics.get("head_alignment", 0.0)),
+                }
+            )
+
+        if len(display_frames) < 8 and i % max(1, len(frame_data) // 8) == 0:
+            frame_bgr = row["frame_bgr"].copy()
+            overlay = draw_pose_overlay(
+                frame_bgr=frame_bgr,
+                keypoints=row.get("keypoints", {}),
+                joint_errors=comparison["joint_errors"],
+                angles=row.get("pose_features", {}),
+            )
+            det = row.get("detection", {})
+            for label, color in (("bat_box", (0, 255, 255)), ("ball_box", (0, 165, 255)), ("player_box", (255, 128, 0))):
+                box = det.get(label)
+                if box is not None:
+                    x1, y1, x2, y2 = box
+                    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(
+                overlay,
+                f"Shot: {raw_shot.replace('_', ' ').title()}",
+                (12, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                overlay,
+                f"Confidence: {confidence_score:.1f}%",
+                (12, 48),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.58,
+                (76, 201, 240),
+                2,
+                cv2.LINE_AA,
+            )
+            display_frames.append(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+            advanced_projection_frames.append(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+
+    if not frame_results:
+        st.warning("No valid feature frames found after extraction.")
+        return None
+
+    bat_path = out.get("bat_path", [])
+    ball_path = out.get("ball_path", [])
+    bat_tracking = _build_bat_tracking_from_path(bat_path)
+    ball_tracking = _build_ball_tracking_from_path(ball_path, bat_tracking.get("smoothed_bat_path", []))
 
     biomechanics_data = {
-        "bat": bat_tracking,
+        "bat": {
+            **bat_tracking,
+            "swing_speed_per_frame": [float(f.get("bat_velocity", 0.0)) for f in out.get("features_by_frame", [])],
+        },
         "ball": ball_tracking,
         "pose3d": {
-            "torso_twist_series": torso_rotation_series,
-            "bat_swing_plane_series": bat_plane_series,
+            "torso_twist_series": [float(f.get("torso_tilt", 0.0)) for f in out.get("features_by_frame", [])],
+            "bat_swing_plane_series": [float(f.get("bat_angle", 0.0)) for f in out.get("features_by_frame", [])],
         },
     }
+
     metrics = compute_performance_metrics(frame_results, biomechanics_data=biomechanics_data)
     bio_scores = summarize_biomechanics(biomechanics_series)
     similarity_series = [fr["similarity_score"] for fr in frame_results]
     avg_features = _aggregate_features(frame_results)
-    avg_comparison = comparator.compare(avg_features, reference_profile)
-    detected_mistakes: List[Dict[str, object]] = []
-    contextual_summary = generate_contextual_feedback(shot_prediction, bio_scores, motion_series)
     final_feedback = {
-        "summary": contextual_summary,
+        "summary": generate_contextual_feedback(shot_prediction, bio_scores, out.get("features_by_frame", [])),
         "tips": [
-            "Track head stability through impact for improved balance.",
-            "Maintain a repeatable bat path in the follow-through phase.",
-            "Use front-knee control to improve shot consistency.",
+            "Keep head alignment stable over the ball line.",
+            "Maintain knee flexion and avoid early body opening.",
+            "Control bat follow-through to improve repeatability.",
         ],
     }
 
@@ -499,7 +450,7 @@ def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_n
     save_analysis_session(
         user_id=user_id,
         video_name=getattr(uploaded_video, "name", "uploaded_video.mp4"),
-        shot_type=str(shot_prediction["shot_type"]),
+        shot_type=raw_shot,
         confidence=confidence_score,
         technique_score=score_card["technique"],
         balance_score=score_card["balance"],
@@ -517,7 +468,7 @@ def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_n
 
     return {
         "player_name": player_name,
-        "fps": fps,
+        "fps": float(out.get("fps", 0.0)),
         "detected_shot": raw_shot,
         "confidence_score": confidence_score,
         "shot_prediction": shot_prediction,
@@ -527,7 +478,7 @@ def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_n
         "avg_features": avg_features,
         "reference_features": reference_features,
         "final_feedback": final_feedback,
-        "detected_mistakes": detected_mistakes,
+        "detected_mistakes": [],
         "display_frames": display_frames,
         "features_df": features_df,
         "similarity_df": similarity_df,
@@ -535,8 +486,8 @@ def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_n
         "frame_table_df": frame_table_df,
         "mistake_summary": mistake_summary,
         "biomechanics": biomechanics_data,
-        "advanced_projection_frames": [cv2.cvtColor(img, cv2.COLOR_BGR2RGB) for img in advanced_projection_frames],
-        "last_frame_rgb": cv2.cvtColor(resized_frames[-1], cv2.COLOR_BGR2RGB) if resized_frames else None,
+        "advanced_projection_frames": advanced_projection_frames,
+        "last_frame_rgb": display_frames[-1] if display_frames else None,
     }
 
 

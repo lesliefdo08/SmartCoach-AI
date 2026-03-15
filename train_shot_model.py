@@ -1,75 +1,96 @@
 from __future__ import annotations
 
-from collections import Counter
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
+from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
 
-from core.shot_classifier import (
-    generate_synthetic_training_data,
-    load_reference_profiles,
-    predict_shot,
-    save_model,
-    train_model,
-)
+from modules.shot_classifier import build_training_matrices, save_classifier, train_classifier
+from modules.video_processor import CricketAnalyticsPipeline
 
 
 ROOT_DIR = Path(__file__).parent
-REFERENCE_DIR = ROOT_DIR / "reference_data"
-MODEL_PATH = ROOT_DIR / "assets" / "shot_classifier.pkl"
+TRAINING_DIR = ROOT_DIR / "training_data"
+MODEL_PATH = ROOT_DIR / "models" / "shot_classifier.pkl"
+VALID_LABELS = ["defensive", "drive", "lofted", "pull", "cut", "sweep"]
 
 
-def evaluate_model(
-    model_bundle: Dict[str, object],
-    test_sequences: List[List[Dict[str, float]]],
-    test_labels: List[str],
-) -> float:
-    preds = [predict_shot(sequence, model_bundle)["shot_type"] for sequence in test_sequences]
-    if not test_labels:
-        return 0.0
-    return float(np.mean(np.array(preds) == np.array(test_labels)))
+def collect_samples_from_videos() -> List[Tuple[Dict[str, float], str]]:
+    pipeline = CricketAnalyticsPipeline(sample_rate=2)
+    samples: List[Tuple[Dict[str, float], str]] = []
+
+    for label in VALID_LABELS:
+        label_dir = TRAINING_DIR / label
+        if not label_dir.exists():
+            continue
+        for video_file in sorted(label_dir.glob("*.mp4")):
+            out = pipeline.process_video(video_file)
+            for f in out.get("window_features", []):
+                samples.append((f, label))
+
+    pipeline.close()
+    return samples
+
+
+def augment_if_sparse(samples: List[Tuple[Dict[str, float], str]]) -> List[Tuple[Dict[str, float], str]]:
+    if samples:
+        return samples
+
+    rng = np.random.default_rng(42)
+    synthetic: List[Tuple[Dict[str, float], str]] = []
+    priors = {
+        "defensive": [80, 68, 0.05, 6, 155, 20, 4, 15],
+        "drive": [130, 42, 0.12, 12, 145, 26, 7, 20],
+        "lofted": [220, 18, 0.20, 14, 140, 34, 11, 35],
+        "pull": [170, 5, 0.09, 20, 135, 30, 10, -5],
+        "cut": [160, -8, 0.08, 22, 138, 28, 9, -20],
+        "sweep": [145, -28, 0.06, 16, 122, 24, 8, -40],
+    }
+    keys = [
+        "bat_swing_arc",
+        "bat_angle",
+        "follow_through_height",
+        "body_rotation",
+        "knee_bend",
+        "head_position",
+        "bat_velocity",
+        "ball_direction",
+    ]
+
+    for label, base in priors.items():
+        for _ in range(240):
+            vals = rng.normal(loc=np.array(base, dtype=np.float32), scale=np.array([12, 10, 0.04, 5, 10, 8, 2, 10], dtype=np.float32))
+            sample = {k: float(v) for k, v in zip(keys, vals)}
+            synthetic.append((sample, label))
+    return synthetic
 
 
 def main() -> None:
-    print("Loading reference profiles...")
-    reference_profiles = load_reference_profiles(REFERENCE_DIR)
+    print("Collecting labeled training videos...")
+    samples = collect_samples_from_videos()
+    samples = augment_if_sparse(samples)
 
-    print("Generating synthetic pose-sequence dataset...")
-    sequences, labels = generate_synthetic_training_data(
-        reference_profiles=reference_profiles,
-        samples_per_class=220,
-        min_seq_len=18,
-        max_seq_len=40,
-        random_state=42,
-    )
-
+    x, y = build_training_matrices(samples)
     x_train, x_test, y_train, y_test = train_test_split(
-        sequences,
-        labels,
+        x,
+        y,
         test_size=0.2,
         random_state=42,
-        stratify=labels,
+        stratify=y,
     )
 
-    print("Training shot classifier...")
-    model_bundle = train_model(
-        sequences=x_train,
-        labels=y_train,
-        model_type="random_forest",
-        random_state=42,
-    )
+    bundle = train_classifier(x_train, y_train)
+    model = bundle["model"]
+    train_acc = float(model.score(x_train, y_train))
+    test_acc = float(model.score(x_test, y_test))
 
-    test_accuracy = evaluate_model(model_bundle, x_test, y_test)
-    model_bundle["test_accuracy"] = test_accuracy
+    print(f"Train Accuracy: {train_acc:.4f}")
+    print(f"Test Accuracy : {test_acc:.4f}")
+    print(classification_report(y_test, model.predict(x_test), digits=3))
 
-    print(f"Train Accuracy: {model_bundle['train_accuracy']:.4f}")
-    print(f"Test Accuracy : {test_accuracy:.4f}")
-    print(f"Classes       : {model_bundle['classes']}")
-    print(f"Samples       : {len(labels)} | Distribution: {dict(Counter(labels))}")
-
-    save_model(model_bundle, MODEL_PATH)
+    save_classifier(bundle, MODEL_PATH)
     print(f"Saved model to: {MODEL_PATH}")
 
 

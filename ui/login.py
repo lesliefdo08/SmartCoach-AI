@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from modules.auth import login_user
+from auth.auth import login_user
 
 
 def render_login() -> None:

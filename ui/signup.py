@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from modules.auth import signup_user
+from auth.auth import signup_user
 
 
 def render_signup() -> None:
