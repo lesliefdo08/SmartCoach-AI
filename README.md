@@ -5,9 +5,12 @@ SmartCoach AI analyzes cricket batting or bowling videos, extracts body pose lan
 ## Features
 
 - Video upload and shot selection interface with Streamlit
+- Login and Sign Up for each player account
+- Password hashing with bcrypt
+- Persistent user-specific session storage (SQLite)
 - Pose detection using MediaPipe Pose
 - Feature extraction of key cricket posture angles
-- Automatic shot-type classification from temporal pose features
+- Temporal shot classification with cricket-specific motion heuristics and smoothing windows
 - Real-time webcam coaching mode with live suggestions
 - Professional analytics dashboard with report export
 - Professional dark-themed Streamlit platform UI with sidebar navigation
@@ -29,6 +32,18 @@ smartcoach-ai/
 - app.py
 - requirements.txt
 - README.md
+- database/
+  - database.py
+- modules/
+  - auth.py
+  - shot_classifier.py
+  - biomechanics.py
+  - pose_detector.py
+  - session_manager.py
+- ui/
+  - login.py
+  - signup.py
+  - dashboard.py
 - core/
   - video_processor.py
   - pose_detector.py

@@ -50,6 +50,13 @@ from core.shot_classifier import (
     train_model,
 )
 from core.video_processor import extract_frames, load_video
+from database.database import init_database
+from modules.biomechanics import compute_biomechanics_frame, summarize_biomechanics
+from modules.session_manager import fetch_user_sessions, save_analysis_session
+from modules.shot_classifier import classify_shot_temporal, generate_contextual_feedback
+from ui.dashboard import render_user_dashboard
+from ui.login import render_login
+from ui.signup import render_signup
 from utils.visualization import (
     draw_3d_skeleton_projection,
     draw_ball_trajectory,
@@ -79,6 +86,7 @@ def _load_reference_profile(shot_type: str) -> Dict[str, object]:
 
 
 def _init_state() -> None:
+    init_database()
     if "session_history" not in st.session_state:
         st.session_state.session_history = []
     if "last_analysis" not in st.session_state:
@@ -87,6 +95,10 @@ def _init_state() -> None:
         st.session_state.player_name = "Athlete"
     if "current_section" not in st.session_state:
         st.session_state.current_section = "Home"
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+    if "user" not in st.session_state:
+        st.session_state.user = None
 
 
 def _aggregate_features(frame_results: List[Dict[str, object]]) -> Dict[str, float]:
@@ -139,10 +151,12 @@ def _load_or_train_mistake_model() -> Dict[str, object]:
 
 
 def _plot_shot_probabilities(probability_map: Dict[str, float]):
+    vals = [float(v) for v in probability_map.values()]
+    scale = 100.0 if (vals and max(vals) <= 1.0) else 1.0
     prob_df = pd.DataFrame(
         {
             "Shot": list(probability_map.keys()),
-            "Probability": [float(v) * 100.0 for v in probability_map.values()],
+            "Probability": [float(v) * scale for v in probability_map.values()],
         }
     ).sort_values("Probability", ascending=False)
 
@@ -252,7 +266,7 @@ def _build_ball_tracking_from_path(ball_centers: List[tuple[int, int]], bat_path
     }
 
 
-def _run_video_analysis(uploaded_video, sample_rate: int, player_name: str) -> Dict[str, object] | None:
+def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_name: str) -> Dict[str, object] | None:
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
             temp_video.write(uploaded_video.read())
@@ -262,9 +276,7 @@ def _run_video_analysis(uploaded_video, sample_rate: int, player_name: str) -> D
         return None
 
     try:
-        with st.spinner("Loading models and video..."):
-            classifier_bundle = _load_or_train_shot_model()
-            mistake_model_bundle = _load_or_train_mistake_model()
+        with st.spinner("Loading video..."):
             cap = load_video(temp_path)
             frames, fps = extract_frames(cap, sample_rate=sample_rate)
             cap.release()
@@ -280,6 +292,9 @@ def _run_video_analysis(uploaded_video, sample_rate: int, player_name: str) -> D
     comparator = PoseComparator()
 
     pose_entries: List[Dict[str, object]] = []
+    keypoint_series: List[Dict[str, tuple[float, float, float]]] = []
+    motion_series: List[Dict[str, float]] = []
+    biomechanics_series: List[Dict[str, float]] = []
     display_candidates: List[Dict[str, object]] = []
     resized_frames: List[np.ndarray] = []
     torso_rotation_series: List[float] = []
@@ -326,6 +341,53 @@ def _run_video_analysis(uploaded_video, sample_rate: int, player_name: str) -> D
             progress.progress(int((idx / total) * 100), text=f"Analyzing frames... {idx}/{total}")
             continue
 
+        keypoint_series.append(keypoints)
+        if len(keypoint_series) >= 2:
+            prev = keypoint_series[-2]
+            curr = keypoint_series[-1]
+
+            lw_prev = np.array(prev["left_wrist"][:2], dtype=np.float32)
+            rw_prev = np.array(prev["right_wrist"][:2], dtype=np.float32)
+            lw_curr = np.array(curr["left_wrist"][:2], dtype=np.float32)
+            rw_curr = np.array(curr["right_wrist"][:2], dtype=np.float32)
+            sh_prev = (np.array(prev["left_shoulder"][:2]) + np.array(prev["right_shoulder"][:2])) / 2.0
+            sh_curr = (np.array(curr["left_shoulder"][:2]) + np.array(curr["right_shoulder"][:2])) / 2.0
+            wr_prev = (lw_prev + rw_prev) / 2.0
+            wr_curr = (lw_curr + rw_curr) / 2.0
+
+            vec_prev = wr_prev - sh_prev
+            vec_curr = wr_curr - sh_curr
+            bat_angle_prev = float(np.degrees(np.arctan2(-vec_prev[1], vec_prev[0])))
+            bat_angle_curr = float(np.degrees(np.arctan2(-vec_curr[1], vec_curr[0])))
+            follow_dx = float(wr_curr[0] - wr_prev[0])
+            follow_dy = float(wr_curr[1] - wr_prev[1])
+            body_lean = float(
+                np.degrees(
+                    np.arctan2(
+                        abs(curr["nose"][0] - ((curr["left_hip"][0] + curr["right_hip"][0]) / 2.0)),
+                        abs(curr["nose"][1] - ((curr["left_hip"][1] + curr["right_hip"][1]) / 2.0)) + 1e-6,
+                    )
+                )
+            )
+            shoulder_vec = np.array(curr["right_shoulder"][:2]) - np.array(curr["left_shoulder"][:2])
+            motion_series.append(
+                {
+                    "bat_swing_arc": abs(bat_angle_curr - bat_angle_prev),
+                    "wrist_velocity": float((np.linalg.norm(lw_curr - lw_prev) + np.linalg.norm(rw_curr - rw_prev)) / 2.0),
+                    "body_lean": body_lean,
+                    "follow_dx": follow_dx,
+                    "follow_dy": follow_dy,
+                    "horizontal_ratio": abs(follow_dx) / (abs(follow_dy) + 1e-6),
+                    "upward_ratio": max(0.0, -follow_dy) / (abs(follow_dx) + 1e-6),
+                    "wrist_height_norm": float((sh_curr[1] - wr_curr[1]) / (abs(sh_curr[1]) + 1e-6)),
+                    "bat_angle": bat_angle_curr,
+                    "shoulder_rotation": float(abs(np.degrees(np.arctan2(shoulder_vec[1], shoulder_vec[0])))),
+                }
+            )
+
+        ball_line_x = float(ball_det["center"][0]) if ball_det.get("center") is not None else float(frame_bgr_small.shape[1]) / 2.0
+        biomechanics_series.append(compute_biomechanics_frame(keypoints=keypoints, ball_line_x=ball_line_x))
+
         pose_entries.append(
             {
                 "frame_index": idx,
@@ -354,11 +416,19 @@ def _run_video_analysis(uploaded_video, sample_rate: int, player_name: str) -> D
     bat_tracking = _build_bat_tracking_from_path(bat_tips)
     ball_tracking = _build_ball_tracking_from_path(ball_centers, bat_tracking.get("smoothed_bat_path", []))
 
-    shot_prediction = predict_shot([entry["features"] for entry in pose_entries], classifier_bundle)
-    detected_shot = str(shot_prediction["shot_type"])
+    shot_prediction = classify_shot_temporal(motion_series, window_size=15)
+    raw_shot = str(shot_prediction["shot_type"])
+    detected_shot = raw_shot.lower().replace(" ", "_")
     confidence_score = float(shot_prediction["confidence_score"])
+    reference_key_map = {
+        "defense": "defense",
+        "drive": "cover_drive",
+        "lofted_shot": "straight_drive",
+        "cut_pull": "pull_shot",
+    }
+    reference_shot = reference_key_map.get(detected_shot, "defense")
     try:
-        reference_profile = _load_reference_profile(detected_shot)
+        reference_profile = _load_reference_profile(reference_shot)
     except Exception as exc:
         st.error(f"Reference profile loading failed: {exc}")
         return None
@@ -397,26 +467,49 @@ def _run_video_analysis(uploaded_video, sample_rate: int, player_name: str) -> D
         },
     }
     metrics = compute_performance_metrics(frame_results, biomechanics_data=biomechanics_data)
+    bio_scores = summarize_biomechanics(biomechanics_series)
     similarity_series = [fr["similarity_score"] for fr in frame_results]
     avg_features = _aggregate_features(frame_results)
     avg_comparison = comparator.compare(avg_features, reference_profile)
-    mistake_output = predict_mistakes(avg_features, mistake_model_bundle)
-    detected_mistakes = mistake_output["detected_mistakes"]
-    final_feedback = generate_feedback(
-        avg_features,
-        reference_features,
-        avg_comparison["joint_errors"],
-        predicted_mistakes=detected_mistakes,
-    )
+    detected_mistakes: List[Dict[str, object]] = []
+    contextual_summary = generate_contextual_feedback(shot_prediction, bio_scores, motion_series)
+    final_feedback = {
+        "summary": contextual_summary,
+        "tips": [
+            "Track head stability through impact for improved balance.",
+            "Maintain a repeatable bat path in the follow-through phase.",
+            "Use front-knee control to improve shot consistency.",
+        ],
+    }
 
     features_df, similarity_df, deviation_df, frame_table_df = build_analysis_frames(frame_results, reference_features)
     mistake_summary = summarize_mistakes_and_suggestions(deviation_df)
-    score_card = _compute_score_card(metrics)
+    score_card = {
+        "technique": bio_scores["technique_score"],
+        "balance": bio_scores["balance_score"],
+        "consistency": bio_scores["consistency_score"],
+        "overall": round(
+            0.4 * bio_scores["technique_score"]
+            + 0.3 * bio_scores["balance_score"]
+            + 0.3 * bio_scores["consistency_score"],
+            2,
+        ),
+    }
+
+    save_analysis_session(
+        user_id=user_id,
+        video_name=getattr(uploaded_video, "name", "uploaded_video.mp4"),
+        shot_type=str(shot_prediction["shot_type"]),
+        confidence=confidence_score,
+        technique_score=score_card["technique"],
+        balance_score=score_card["balance"],
+        consistency_score=score_card["consistency"],
+    )
 
     session_entry = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "player": player_name,
-        "shot": detected_shot,
+        "shot": raw_shot,
         "confidence": round(confidence_score, 2),
         "overall_score": score_card["overall"],
     }
@@ -425,7 +518,7 @@ def _run_video_analysis(uploaded_video, sample_rate: int, player_name: str) -> D
     return {
         "player_name": player_name,
         "fps": fps,
-        "detected_shot": detected_shot,
+        "detected_shot": raw_shot,
         "confidence_score": confidence_score,
         "shot_prediction": shot_prediction,
         "metrics": metrics,
@@ -754,6 +847,20 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
+    if not st.session_state.authenticated:
+        st.markdown("### Login or Sign Up")
+        login_tab, signup_tab = st.tabs(["Login", "Sign Up"])
+        with login_tab:
+            render_login()
+        with signup_tab:
+            render_signup()
+        return
+
+    user = st.session_state.user
+    if not user:
+        st.session_state.authenticated = False
+        st.rerun()
+
     st.markdown(
         """
         <div class="hero-wrap">
@@ -777,10 +884,11 @@ def main() -> None:
     st.divider()
 
     with st.sidebar:
+        st.markdown(f"### User: {user['username']}")
         player_name = st.text_input("Player Name", value=st.session_state.player_name)
         st.session_state.player_name = player_name
 
-        options = ["Home", "Video Analysis", "Live Coaching", "Performance Reports", "Advanced Biomechanics"]
+        options = ["Home", "Video Analysis", "Live Coaching", "Performance Reports", "Advanced Biomechanics", "My Dashboard"]
         current = st.session_state.current_section if st.session_state.current_section in options else "Home"
         section = st.radio(
             "Navigation",
@@ -789,11 +897,21 @@ def main() -> None:
         )
         st.session_state.current_section = section
 
+        if st.button("Logout", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state.user = None
+            st.session_state.last_analysis = None
+            st.rerun()
+
         st.divider()
         st.markdown("### Session Statistics")
-        history = st.session_state.session_history
+        history = fetch_user_sessions(int(user["id"]), limit=200)
         total_sessions = len(history)
-        avg_overall = float(np.mean([h["overall_score"] for h in history])) if history else 0.0
+        avg_overall = (
+            float(np.mean([(float(h["technique_score"]) + float(h["balance_score"]) + float(h["consistency_score"])) / 3.0 for h in history]))
+            if history
+            else 0.0
+        )
         st.metric("Sessions", str(total_sessions))
         st.metric("Avg Overall", f"{avg_overall:.1f}%")
 
@@ -855,7 +973,7 @@ def main() -> None:
         process_clicked = st.button("Process Video", type="primary", use_container_width=True)
 
         if process_clicked and uploaded_video is not None:
-            analysis = _run_video_analysis(uploaded_video, sample_rate, player_name)
+            analysis = _run_video_analysis(uploaded_video, sample_rate, int(user["id"]), player_name)
             if analysis is not None:
                 st.session_state.last_analysis = analysis
 
@@ -901,13 +1019,16 @@ def main() -> None:
             return
         _render_report_view(analysis)
 
-    else:
+    elif section == "Advanced Biomechanics":
         st.subheader("Advanced Biomechanics")
         analysis = st.session_state.last_analysis
         if not analysis:
             st.info("No analyzed session found. Run Video Analysis first.")
             return
         _render_advanced_biomechanics_view(analysis)
+
+    else:
+        render_user_dashboard(int(user["id"]))
 
 
 if __name__ == "__main__":
