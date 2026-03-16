@@ -8,6 +8,7 @@ import numpy as np
 FRAME_FEATURES = [
     "bat_swing_arc",
     "bat_angle",
+    "bat_follow_through_height",
     "follow_through_height",
     "shoulder_rotation",
     "knee_bend",
@@ -22,6 +23,7 @@ def merge_features(object_features: Dict[str, float], pose_features: Dict[str, f
     merged = {
         "bat_swing_arc": float(object_features.get("bat_swing_arc", 0.0)),
         "bat_angle": float(object_features.get("bat_angle", 0.0)),
+        "bat_follow_through_height": float(object_features.get("bat_follow_through_height", 0.0)),
         "follow_through_height": float(pose_features.get("follow_through_height", 0.0)),
         "shoulder_rotation": float(pose_features.get("shoulder_rotation", pose_features.get("body_rotation", 0.0))),
         "knee_bend": float(pose_features.get("knee_bend", 0.0)),

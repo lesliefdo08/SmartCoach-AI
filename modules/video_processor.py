@@ -23,6 +23,14 @@ class CricketAnalyticsPipeline:
         self.pose_tracker = CricketPoseTracker(min_confidence=0.45)
 
     def process_video(self, video_path: str | Path) -> Dict[str, object]:
+        return self.process_video_filtered(video_path=video_path, strict_filter=False)
+
+    def process_video_filtered(
+        self,
+        video_path: str | Path,
+        strict_filter: bool = False,
+        min_player_area_ratio: float = 0.25,
+    ) -> Dict[str, object]:
         cap = load_video(str(video_path))
         frames, fps = extract_frames(cap, sample_rate=max(1, self.sample_rate))
         cap.release()
@@ -36,13 +44,25 @@ class CricketAnalyticsPipeline:
             rgb_norm = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
             det = self.detector.detect(frame)
+            player_box = det.get("player_box")
+            bat_box = det.get("bat_box")
             paths = track_paths(paths, det)
-            obj_features = movement_features(paths)
+            obj_features = movement_features(paths, frame_shape=frame.shape)
 
             keypoints = self.pose_tracker.track_landmarks(rgb_norm)
+
+            if strict_filter:
+                if not keypoints or bat_box is None or player_box is None:
+                    continue
+                x1, y1, x2, y2 = player_box
+                player_area = max(0, x2 - x1) * max(0, y2 - y1)
+                frame_area = frame.shape[0] * frame.shape[1]
+                if frame_area <= 0 or (player_area / frame_area) < min_player_area_ratio:
+                    continue
+
             bat_center = None
-            if det.get("bat_box") is not None:
-                x1, y1, x2, y2 = det["bat_box"]
+            if bat_box is not None:
+                x1, y1, x2, y2 = bat_box
                 bat_center = (int((x1 + x2) / 2), int((y1 + y2) / 2))
             pose_metrics = compute_pose_biomechanics(keypoints, bat_center=bat_center)
 

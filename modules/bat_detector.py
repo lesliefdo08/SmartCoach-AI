@@ -95,13 +95,14 @@ def track_paths(paths: Dict[str, List[Point]], detection: Dict[str, object], max
     return paths
 
 
-def movement_features(paths: Dict[str, List[Point]]) -> Dict[str, float]:
+def movement_features(paths: Dict[str, List[Point]], frame_shape: tuple[int, int, int] | None = None) -> Dict[str, float]:
     bat_path = paths.get("bat", [])
     ball_path = paths.get("ball", [])
 
     bat_swing_arc = 0.0
     bat_velocity = 0.0
     bat_angle = 0.0
+    bat_follow_through_height = 0.0
     ball_direction = 0.0
 
     if len(bat_path) >= 3:
@@ -111,6 +112,12 @@ def movement_features(paths: Dict[str, List[Point]]) -> Dict[str, float]:
         angles = np.degrees(np.arctan2(-vectors[:, 1], vectors[:, 0]))
         bat_swing_arc = float(np.max(angles) - np.min(angles))
         bat_angle = float(angles[-1])
+        y_start = float(arr[0, 1])
+        y_end = float(arr[-1, 1])
+        if frame_shape is not None and frame_shape[0] > 0:
+            bat_follow_through_height = float((y_start - y_end) / frame_shape[0])
+        else:
+            bat_follow_through_height = float(y_start - y_end)
 
     if len(ball_path) >= 2:
         p0 = np.array(ball_path[-2], dtype=np.float32)
@@ -122,5 +129,6 @@ def movement_features(paths: Dict[str, List[Point]]) -> Dict[str, float]:
         "bat_swing_arc": round(bat_swing_arc, 3),
         "bat_velocity": round(bat_velocity, 3),
         "bat_angle": round(bat_angle, 3),
+        "bat_follow_through_height": round(bat_follow_through_height, 3),
         "ball_direction": round(ball_direction, 3),
     }

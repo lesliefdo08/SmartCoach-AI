@@ -12,6 +12,9 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from modules.bat_detector import YOLOBatBallDetector
+from modules.pose_detector import CricketPoseTracker
+
 
 QUERIES: Dict[str, str] = {
     "defensive": "cricket defensive shot slow motion",
@@ -42,7 +45,14 @@ def _download_label_videos(label: str, query: str, out_dir: Path, max_videos: in
         ydl.download([search])
 
 
-def _extract_frames(video_path: Path, frames_dir: Path, sample_step: int = 5) -> int:
+def _extract_frames(
+    video_path: Path,
+    frames_dir: Path,
+    yolo_detector: YOLOBatBallDetector,
+    pose_tracker: CricketPoseTracker,
+    sample_step: int = 5,
+    min_player_area_ratio: float = 0.25,
+) -> int:
     frames_dir.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -59,9 +69,28 @@ def _extract_frames(video_path: Path, frames_dir: Path, sample_step: int = 5) ->
         if not ok:
             break
         if idx % sample_step == 0:
-            out = clip_dir / f"frame_{idx:06d}.jpg"
-            cv2.imwrite(str(out), frame)
-            saved += 1
+            h, w = frame.shape[:2]
+            det = yolo_detector.detect(frame)
+            bat_box = det.get("bat_box")
+            player_box = det.get("player_box")
+
+            rgb_norm = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype("float32") / 255.0
+            keypoints = pose_tracker.track_landmarks(rgb_norm)
+
+            keep = True
+            if not keypoints or bat_box is None or player_box is None:
+                keep = False
+            else:
+                x1, y1, x2, y2 = player_box
+                player_area = max(0, x2 - x1) * max(0, y2 - y1)
+                frame_area = max(1, h * w)
+                if (player_area / frame_area) < min_player_area_ratio:
+                    keep = False
+
+            if keep:
+                out = clip_dir / f"frame_{idx:06d}.jpg"
+                cv2.imwrite(str(out), frame)
+                saved += 1
         idx += 1
 
     cap.release()
@@ -69,6 +98,9 @@ def _extract_frames(video_path: Path, frames_dir: Path, sample_step: int = 5) ->
 
 
 def build_dataset(dataset_root: Path, max_videos_per_class: int, frame_step: int) -> None:
+    yolo_detector = YOLOBatBallDetector()
+    pose_tracker = CricketPoseTracker(min_confidence=0.45)
+
     for label, query in QUERIES.items():
         label_dir = dataset_root / label
         _download_label_videos(label, query, label_dir, max_videos=max_videos_per_class)
@@ -78,9 +110,18 @@ def build_dataset(dataset_root: Path, max_videos_per_class: int, frame_step: int
 
         total_saved = 0
         for video in videos:
-            total_saved += _extract_frames(video, frames_dir, sample_step=frame_step)
+            total_saved += _extract_frames(
+                video,
+                frames_dir,
+                yolo_detector=yolo_detector,
+                pose_tracker=pose_tracker,
+                sample_step=frame_step,
+                min_player_area_ratio=0.25,
+            )
 
         print(f"[{label}] videos={len(videos)} extracted_frames={total_saved}")
+
+    pose_tracker.close()
 
 
 if __name__ == "__main__":

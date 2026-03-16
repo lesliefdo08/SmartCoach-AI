@@ -12,6 +12,7 @@ LABELS = ["defensive", "drive", "lofted", "pull", "cut", "sweep"]
 FEATURE_ORDER = [
     "bat_swing_arc",
     "bat_angle",
+    "bat_follow_through_height",
     "follow_through_height",
     "shoulder_rotation",
     "knee_bend",
@@ -46,11 +47,9 @@ def _vectorize(features: Dict[str, float]) -> np.ndarray:
 
 def train_classifier(training_x: np.ndarray, training_y: np.ndarray, random_state: int = 42) -> Dict[str, object]:
     clf = RandomForestClassifier(
-        n_estimators=500,
-        max_depth=None,
-        min_samples_split=3,
-        min_samples_leaf=1,
-        class_weight="balanced_subsample",
+        n_estimators=300,
+        max_depth=20,
+        class_weight="balanced",
         random_state=random_state,
         n_jobs=-1,
     )

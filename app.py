@@ -106,10 +106,11 @@ def _init_state() -> None:
         st.session_state.player_name = "Athlete"
     if "current_section" not in st.session_state:
         st.session_state.current_section = "Home"
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-    if "user" not in st.session_state:
-        st.session_state.user = None
+    if "shot_model" not in st.session_state:
+        try:
+            st.session_state.shot_model = _load_or_train_shot_model()
+        except Exception:
+            st.session_state.shot_model = None
 
 
 def _aggregate_features(frame_results: List[Dict[str, object]]) -> Dict[str, float]:
@@ -135,16 +136,17 @@ def _load_or_train_shot_model() -> Dict[str, object]:
 
     rng = np.random.default_rng(42)
     priors = {
-        "defensive": [80, 68, 0.05, 8, 155, 9, 20, 4, 15],
-        "drive": [130, 42, 0.12, 14, 145, 12, 26, 7, 20],
-        "lofted": [220, 18, 0.20, 18, 140, 14, 34, 11, 35],
-        "pull": [170, 5, 0.09, 22, 135, 11, 30, 10, -5],
-        "cut": [160, -8, 0.08, 24, 138, 10, 28, 9, -20],
-        "sweep": [145, -28, 0.06, 16, 122, 7, 24, 8, -40],
+        "defensive": [80, 68, 0.08, 0.05, 8, 155, 9, 20, 4, 15],
+        "drive": [130, 42, 0.14, 0.12, 14, 145, 12, 26, 7, 20],
+        "lofted": [220, 18, 0.24, 0.20, 18, 140, 14, 34, 11, 35],
+        "pull": [170, 5, 0.10, 0.09, 22, 135, 11, 30, 10, -5],
+        "cut": [160, -8, 0.09, 0.08, 24, 138, 10, 28, 9, -20],
+        "sweep": [145, -28, 0.07, 0.06, 16, 122, 7, 24, 8, -40],
     }
     keys = [
         "bat_swing_arc",
         "bat_angle",
+        "bat_follow_through_height",
         "follow_through_height",
         "shoulder_rotation",
         "knee_bend",
@@ -156,7 +158,7 @@ def _load_or_train_shot_model() -> Dict[str, object]:
     samples = []
     for label, base in priors.items():
         for _ in range(280):
-            vals = rng.normal(loc=np.array(base, dtype=np.float32), scale=np.array([12, 10, 0.04, 5, 10, 4, 8, 2, 10], dtype=np.float32))
+            vals = rng.normal(loc=np.array(base, dtype=np.float32), scale=np.array([12, 10, 0.05, 0.04, 5, 10, 4, 8, 2, 10], dtype=np.float32))
             samples.append(({k: float(v) for k, v in zip(keys, vals)}, label))
 
     x, y = build_training_matrices(samples)
@@ -301,7 +303,8 @@ def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_n
         return None
 
     try:
-        shot_model = _load_or_train_shot_model()
+        shot_model = st.session_state.get("shot_model") or _load_or_train_shot_model()
+        st.session_state.shot_model = shot_model
         pipeline = CricketAnalyticsPipeline(sample_rate=sample_rate, target_size=(854, 480))
         out = pipeline.process_video(temp_path)
         pipeline.close()
