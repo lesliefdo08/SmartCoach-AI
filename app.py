@@ -58,7 +58,7 @@ from core.shot_classifier import (
 from core.video_processor import extract_frames, load_video
 from database.database import init_database
 from modules.biomechanics import compute_biomechanics_frame, summarize_biomechanics
-from modules.session_manager import fetch_user_sessions, save_analysis_session
+from modules.session_manager import save_analysis_session
 from modules.shot_classifier import (
     build_training_matrices,
     classify_shot_ml,
@@ -68,9 +68,6 @@ from modules.shot_classifier import (
     train_classifier,
 )
 from modules.video_processor import CricketAnalyticsPipeline
-from ui.dashboard import render_user_dashboard
-from ui.login import render_login
-from ui.signup import render_signup
 from utils.visualization import (
     draw_3d_skeleton_projection,
     draw_ball_trajectory,
@@ -138,19 +135,20 @@ def _load_or_train_shot_model() -> Dict[str, object]:
 
     rng = np.random.default_rng(42)
     priors = {
-        "defensive": [80, 68, 0.05, 6, 155, 20, 4, 15],
-        "drive": [130, 42, 0.12, 12, 145, 26, 7, 20],
-        "lofted": [220, 18, 0.20, 14, 140, 34, 11, 35],
-        "pull": [170, 5, 0.09, 20, 135, 30, 10, -5],
-        "cut": [160, -8, 0.08, 22, 138, 28, 9, -20],
-        "sweep": [145, -28, 0.06, 16, 122, 24, 8, -40],
+        "defensive": [80, 68, 0.05, 8, 155, 9, 20, 4, 15],
+        "drive": [130, 42, 0.12, 14, 145, 12, 26, 7, 20],
+        "lofted": [220, 18, 0.20, 18, 140, 14, 34, 11, 35],
+        "pull": [170, 5, 0.09, 22, 135, 11, 30, 10, -5],
+        "cut": [160, -8, 0.08, 24, 138, 10, 28, 9, -20],
+        "sweep": [145, -28, 0.06, 16, 122, 7, 24, 8, -40],
     }
     keys = [
         "bat_swing_arc",
         "bat_angle",
         "follow_through_height",
-        "body_rotation",
+        "shoulder_rotation",
         "knee_bend",
+        "torso_tilt",
         "head_position",
         "bat_velocity",
         "ball_direction",
@@ -158,7 +156,7 @@ def _load_or_train_shot_model() -> Dict[str, object]:
     samples = []
     for label, base in priors.items():
         for _ in range(280):
-            vals = rng.normal(loc=np.array(base, dtype=np.float32), scale=np.array([12, 10, 0.04, 5, 10, 8, 2, 10], dtype=np.float32))
+            vals = rng.normal(loc=np.array(base, dtype=np.float32), scale=np.array([12, 10, 0.04, 5, 10, 4, 8, 2, 10], dtype=np.float32))
             samples.append(({k: float(v) for k, v in zip(keys, vals)}, label))
 
     x, y = build_training_matrices(samples)
@@ -453,15 +451,18 @@ def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_n
         ),
     }
 
-    save_analysis_session(
-        user_id=user_id,
-        video_name=getattr(uploaded_video, "name", "uploaded_video.mp4"),
-        shot_type=raw_shot,
-        confidence=confidence_score,
-        technique_score=score_card["technique"],
-        balance_score=score_card["balance"],
-        consistency_score=score_card["consistency"],
-    )
+    try:
+        save_analysis_session(
+            user_id=user_id,
+            video_name=getattr(uploaded_video, "name", "uploaded_video.mp4"),
+            shot_type=raw_shot,
+            confidence=confidence_score,
+            technique_score=score_card["technique"],
+            balance_score=score_card["balance"],
+            consistency_score=score_card["consistency"],
+        )
+    except Exception:
+        pass
 
     session_entry = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -804,20 +805,6 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    if not st.session_state.authenticated:
-        st.markdown("### Login or Sign Up")
-        login_tab, signup_tab = st.tabs(["Login", "Sign Up"])
-        with login_tab:
-            render_login()
-        with signup_tab:
-            render_signup()
-        return
-
-    user = st.session_state.user
-    if not user:
-        st.session_state.authenticated = False
-        st.rerun()
-
     st.markdown(
         """
         <div class="hero-wrap">
@@ -841,11 +828,10 @@ def main() -> None:
     st.divider()
 
     with st.sidebar:
-        st.markdown(f"### User: {user['username']}")
         player_name = st.text_input("Player Name", value=st.session_state.player_name)
         st.session_state.player_name = player_name
 
-        options = ["Home", "Video Analysis", "Live Coaching", "Performance Reports", "Advanced Biomechanics", "My Dashboard"]
+        options = ["Home", "Video Analysis", "Live Coaching", "Performance Reports", "Advanced Biomechanics"]
         current = st.session_state.current_section if st.session_state.current_section in options else "Home"
         section = st.radio(
             "Navigation",
@@ -854,21 +840,11 @@ def main() -> None:
         )
         st.session_state.current_section = section
 
-        if st.button("Logout", use_container_width=True):
-            st.session_state.authenticated = False
-            st.session_state.user = None
-            st.session_state.last_analysis = None
-            st.rerun()
-
         st.divider()
         st.markdown("### Session Statistics")
-        history = fetch_user_sessions(int(user["id"]), limit=200)
+        history = st.session_state.session_history
         total_sessions = len(history)
-        avg_overall = (
-            float(np.mean([(float(h["technique_score"]) + float(h["balance_score"]) + float(h["consistency_score"])) / 3.0 for h in history]))
-            if history
-            else 0.0
-        )
+        avg_overall = float(np.mean([float(h.get("overall_score", 0.0)) for h in history])) if history else 0.0
         st.metric("Sessions", str(total_sessions))
         st.metric("Avg Overall", f"{avg_overall:.1f}%")
 
@@ -930,7 +906,7 @@ def main() -> None:
         process_clicked = st.button("Process Video", type="primary", use_container_width=True)
 
         if process_clicked and uploaded_video is not None:
-            analysis = _run_video_analysis(uploaded_video, sample_rate, int(user["id"]), player_name)
+            analysis = _run_video_analysis(uploaded_video, sample_rate, 1, player_name)
             if analysis is not None:
                 st.session_state.last_analysis = analysis
 
@@ -985,7 +961,7 @@ def main() -> None:
         _render_advanced_biomechanics_view(analysis)
 
     else:
-        render_user_dashboard(int(user["id"]))
+        st.info("Select a section from the sidebar.")
 
 
 if __name__ == "__main__":

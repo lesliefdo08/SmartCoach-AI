@@ -141,6 +141,7 @@ def compute_pose_biomechanics(keypoints: Dict[str, Keypoint], bat_center: tuple[
             "head_alignment": 0.0,
             "bat_arm_alignment": 0.0,
             "follow_through_height": 0.0,
+            "shoulder_rotation": 0.0,
             "body_rotation": 0.0,
             "head_position": 0.0,
         }
@@ -199,6 +200,7 @@ def compute_pose_biomechanics(keypoints: Dict[str, Keypoint], bat_center: tuple[
         "head_alignment": round(head_alignment, 3),
         "bat_arm_alignment": round(float(np.clip(bat_arm_alignment, 0.0, 180.0)), 3),
         "follow_through_height": round(follow_through_height, 3),
+        "shoulder_rotation": round(body_rotation, 3),
         "body_rotation": round(body_rotation, 3),
         "head_position": round(head_position, 3),
     }

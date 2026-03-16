@@ -10,3 +10,4 @@ scikit-learn
 protobuf<4
 bcrypt
 joblib
+yt-dlp

@@ -12,6 +12,8 @@ SmartCoach AI analyzes cricket batting or bowling videos, extracts body pose lan
 - Pose detection using MediaPipe Pose
 - Feature extraction of key cricket posture angles
 - ML shot classification using RandomForest over temporal CV+pose features
+- Automatic dataset builder with YouTube download support (`training/dataset_builder.py`)
+- Training pipeline for classifier model (`training/train_model.py`)
 - Real-time webcam coaching mode with live suggestions
 - Professional analytics dashboard with report export
 - Professional dark-themed Streamlit platform UI with sidebar navigation
@@ -39,6 +41,9 @@ smartcoach-ai/
   - database.py
 - models/
   - shot_classifier.pkl
+- training/
+  - dataset_builder.py
+  - train_model.py
 - modules/
   - video_processor.py
   - bat_detector.py
