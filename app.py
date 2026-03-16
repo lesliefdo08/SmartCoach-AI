@@ -11,8 +11,8 @@ import streamlit as st
 
 try:
     import cv2
-except ImportError:
-    st.error("OpenCV failed to load. Check requirements.txt dependencies.")
+except Exception as e:
+    st.error(f"OpenCV failed to load: {e}")
     st.stop()
 
 import matplotlib.pyplot as plt
