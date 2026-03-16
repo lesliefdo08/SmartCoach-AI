@@ -10,6 +10,7 @@ from typing import Dict, List
 
 import cv2
 import numpy as np
+import streamlit as st
 
 from core.feedback_engine import generate_feedback
 from core.frame_pipeline import FramePipeline
@@ -22,12 +23,12 @@ def run_realtime_coaching(
     camera_index: int = 0,
     target_size: tuple[int, int] = (854, 480),
     save_dir: str | Path = "assets/realtime_captures",
+    max_frames: int = 600,
+    save_interval_frames: int = 120,
 ) -> None:
     """Run live coaching on webcam frames.
 
-    Hotkeys:
-    - Q: Quit
-    - S: Save current frame analysis
+    Frames are rendered using Streamlit images for cloud compatibility.
     """
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
@@ -53,9 +54,10 @@ def run_realtime_coaching(
     ball_path: List[tuple[int, int]] = []
     previous_pose: Dict[str, object] = {}
     frame_counter = 0
+    placeholder = st.empty()
 
     try:
-        while True:
+        while frame_counter < max_frames:
             ok, frame_bgr = cap.read()
             if not ok:
                 continue
@@ -171,7 +173,7 @@ def run_realtime_coaching(
 
             cv2.putText(
                 overlay,
-                "Hotkeys: Q=Quit | S=Save",
+                "Live stream mode (Streamlit)",
                 (12, target_size[1] - 14),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
@@ -190,13 +192,9 @@ def run_realtime_coaching(
                 "tips": tips,
             }
 
-            cv2.imshow("SmartCoach AI - Live Coaching", overlay)
-            key = cv2.waitKey(1) & 0xFF
+            placeholder.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
 
-            if key == ord("q") or key == ord("Q"):
-                break
-
-            if key == ord("s") or key == ord("S"):
+            if save_interval_frames > 0 and frame_counter % save_interval_frames == 0:
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 image_path = save_path / f"analysis_{stamp}.jpg"
                 json_path = save_path / f"analysis_{stamp}.json"
@@ -209,4 +207,4 @@ def run_realtime_coaching(
     finally:
         pipeline.close()
         cap.release()
-        cv2.destroyAllWindows()
+        st.info("Live coaching stream ended.")

@@ -7,11 +7,17 @@ import threading
 from pathlib import Path
 from typing import Dict, List
 
-import cv2
+import streamlit as st
+
+try:
+    import cv2
+except ImportError:
+    st.error("OpenCV failed to load. Check requirements.txt dependencies.")
+    st.stop()
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import streamlit as st
 
 from analytics.dashboard import (
     build_analysis_frames,
