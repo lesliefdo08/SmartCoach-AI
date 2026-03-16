@@ -8,12 +8,7 @@ from pathlib import Path
 from typing import Dict, List
 
 import streamlit as st
-
-try:
-    import cv2
-except Exception as e:
-    st.error(f"OpenCV failed to load: {e}")
-    st.stop()
+import cv2
 
 import matplotlib.pyplot as plt
 import numpy as np
