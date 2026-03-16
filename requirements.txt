@@ -1,12 +1,12 @@
-streamlit
+streamlit==1.55.0
 opencv-python-headless==4.11.0.86
 mediapipe==0.10.32
-ultralytics
-numpy
+ultralytics==8.3.0
+numpy==1.26.4
 pandas
 matplotlib
 scikit-learn
 joblib
 yt-dlp
 bcrypt
-protobuf>=4.25
+protobuf>=4.25,<5

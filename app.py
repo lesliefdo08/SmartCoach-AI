@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import streamlit as st
+st.write("Environment check")
+
+import cv2
+st.write("OpenCV version:", cv2.__version__)
+
 from datetime import datetime
 import json
 import tempfile
 import threading
 from pathlib import Path
 from typing import Dict, List
-
-import streamlit as st
-import cv2
 
 import matplotlib.pyplot as plt
 import numpy as np
