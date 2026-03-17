@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -21,6 +22,11 @@ class CricketAnalyticsPipeline:
     def __post_init__(self) -> None:
         self.detector = YOLOBatBallDetector()
         self.pose_tracker = CricketPoseTracker(min_confidence=0.45)
+        self.motion_start_floor = 1.5
+        self.motion_start_percentile = 40.0
+        self.motion_peak_percentile = 85.0
+        self.motion_peak_multiplier = 1.8
+        self._load_calibration_settings()
 
     def process_video(self, video_path: str | Path) -> Dict[str, object]:
         return self.process_video_filtered(video_path=video_path, strict_filter=False)
@@ -105,8 +111,8 @@ class CricketAnalyticsPipeline:
 
         if features_by_frame:
             move_arr = np.array(motion_scores, dtype=np.float32)
-            start_threshold = float(max(1.5, np.percentile(move_arr, 40)))
-            peak_threshold = float(max(start_threshold * 1.8, np.percentile(move_arr, 85)))
+            start_threshold = float(max(self.motion_start_floor, np.percentile(move_arr, self.motion_start_percentile)))
+            peak_threshold = float(max(start_threshold * self.motion_peak_multiplier, np.percentile(move_arr, self.motion_peak_percentile)))
 
             for f in features_by_frame:
                 score = float(f.get("motion_score", 0.0))
@@ -136,6 +142,21 @@ class CricketAnalyticsPipeline:
 
     def close(self) -> None:
         self.pose_tracker.close()
+
+    def _load_calibration_settings(self) -> None:
+        calibration_path = Path(__file__).resolve().parents[1] / "models" / "calibration.json"
+        if not calibration_path.exists():
+            return
+        try:
+            with calibration_path.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            return
+
+        self.motion_start_floor = float(payload.get("motion_start_floor", self.motion_start_floor))
+        self.motion_start_percentile = float(payload.get("motion_start_percentile", self.motion_start_percentile))
+        self.motion_peak_percentile = float(payload.get("motion_peak_percentile", self.motion_peak_percentile))
+        self.motion_peak_multiplier = float(payload.get("motion_peak_multiplier", self.motion_peak_multiplier))
 
     @staticmethod
     def _wrist_center(keypoints: Dict[str, Tuple[float, float, float]]) -> Optional[np.ndarray]:

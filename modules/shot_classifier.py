@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from collections import Counter
+import re
 from typing import Dict, List, Sequence, Tuple
 
 import joblib
@@ -98,12 +99,49 @@ def load_classifier(model_path: str | Path) -> Dict[str, object]:
     return joblib.load(Path(model_path))
 
 
+def save_classifier_versioned(bundle: Dict[str, object], models_dir: str | Path, prefix: str = "shot_model_v") -> Path:
+    model_root = Path(models_dir)
+    model_root.mkdir(parents=True, exist_ok=True)
+
+    existing = list_model_versions(model_root, prefix=prefix)
+    next_version = (max([v for _, v in existing]) + 1) if existing else 1
+    out_path = model_root / f"{prefix}{next_version}.pkl"
+    save_classifier(bundle, out_path)
+    return out_path
+
+
+def list_model_versions(models_dir: str | Path, prefix: str = "shot_model_v") -> List[Tuple[Path, int]]:
+    model_root = Path(models_dir)
+    if not model_root.exists():
+        return []
+
+    pattern = re.compile(rf"^{re.escape(prefix)}(\d+)\.pkl$")
+    out: List[Tuple[Path, int]] = []
+    for p in model_root.glob(f"{prefix}*.pkl"):
+        m = pattern.match(p.name)
+        if m:
+            out.append((p, int(m.group(1))))
+    return sorted(out, key=lambda x: x[1])
+
+
+def get_latest_model_path(models_dir: str | Path, legacy_path: str | Path | None = None, prefix: str = "shot_model_v") -> Path | None:
+    versions = list_model_versions(models_dir, prefix=prefix)
+    if versions:
+        return versions[-1][0]
+
+    if legacy_path is not None:
+        legacy = Path(legacy_path)
+        if legacy.exists():
+            return legacy
+    return None
+
+
 def classify_shot_ml(
     feature_series: Sequence[Dict[str, float]],
     model_bundle: Dict[str, object],
     window_size: int = 15,
     smooth_window: int = 7,
-    low_conf_threshold: float = 60.0,
+    low_conf_threshold: float | None = None,
 ) -> Dict[str, object]:
     windows = _window_average(feature_series, window_size=window_size)
     if not windows:
@@ -117,6 +155,9 @@ def classify_shot_ml(
     model: RandomForestClassifier = model_bundle["model"]
     labels = list(model_bundle.get("labels", LABELS))
     model_feature_order = list(model_bundle.get("feature_order", FEATURE_ORDER))
+    calibration = model_bundle.get("calibration", {}) if isinstance(model_bundle, dict) else {}
+    if low_conf_threshold is None:
+        low_conf_threshold = float(calibration.get("low_confidence_threshold", 60.0))
 
     probabilities = []
     frame_predictions: List[str] = []

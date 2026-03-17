@@ -62,9 +62,11 @@ from modules.shot_classifier import (
     FEATURE_ORDER,
     build_training_matrices,
     classify_shot_ml,
+    get_latest_model_path,
     generate_contextual_feedback,
     load_classifier,
     save_classifier,
+    save_classifier_versioned,
     train_classifier,
 )
 from modules.video_processor import CricketAnalyticsPipeline
@@ -78,7 +80,8 @@ from utils.visualization import (
 
 ROOT_DIR = Path(__file__).parent
 REFERENCE_DIR = ROOT_DIR / "reference_data"
-MODEL_PATH = ROOT_DIR / "models" / "shot_classifier.pkl"
+MODEL_DIR = ROOT_DIR / "models"
+MODEL_PATH = MODEL_DIR / "shot_classifier.pkl"
 MISTAKE_MODEL_PATH = ROOT_DIR / "assets" / "mistake_detector.pkl"
 
 
@@ -131,8 +134,9 @@ def _aggregate_features(frame_results: List[Dict[str, object]]) -> Dict[str, flo
 
 
 def _load_or_train_shot_model() -> Dict[str, object]:
-    if MODEL_PATH.exists():
-        bundle = load_classifier(MODEL_PATH)
+    latest_model = get_latest_model_path(MODEL_DIR, legacy_path=MODEL_PATH)
+    if latest_model is not None:
+        bundle = load_classifier(latest_model)
         existing_order = list(bundle.get("feature_order", []))
         sklearn_version = str(bundle.get("sklearn_version", ""))
         if existing_order and set(FEATURE_ORDER).issubset(set(existing_order)) and sklearn_version == sklearn.__version__:
@@ -197,6 +201,7 @@ def _load_or_train_shot_model() -> Dict[str, object]:
     x, y = build_training_matrices(samples)
     bundle = train_classifier(x, y)
     save_classifier(bundle, MODEL_PATH)
+    save_classifier_versioned(bundle, MODEL_DIR)
     return bundle
 
 
