@@ -124,7 +124,72 @@ class CricketAnalyticsPipeline:
                     phase = 1.0
                 f["motion_phase"] = phase
 
-        key_features = [f for f in features_by_frame if float(f.get("motion_phase", 0.0)) > 0.0]
+            bat_vel = np.array([float(f.get("bat_velocity", 0.0)) for f in features_by_frame], dtype=np.float32)
+            bat_angle = np.array([float(f.get("bat_angle", 0.0)) for f in features_by_frame], dtype=np.float32)
+            direction_change = np.zeros_like(bat_angle)
+            if len(bat_angle) >= 2:
+                direction_change[1:] = np.abs(np.diff(bat_angle))
+
+            impact_score = bat_vel + 0.75 * direction_change
+            impact_idx = int(np.argmax(impact_score)) if len(impact_score) else 0
+
+            pre_start = max(0, impact_idx - 2)
+            pre_end = max(0, impact_idx - 1)
+            post_start = min(len(features_by_frame) - 1, impact_idx + 1)
+            post_end = min(len(features_by_frame) - 1, impact_idx + 2)
+            key_indices = set(range(pre_start, post_end + 1))
+
+            bat_angle_impact = float(features_by_frame[impact_idx].get("bat_angle", 0.0))
+
+            post_follow_vals = [
+                float(features_by_frame[i].get("follow_through_height", 0.0))
+                for i in range(impact_idx, len(features_by_frame))
+            ]
+            follow_through_height_max = float(np.max(post_follow_vals)) if post_follow_vals else 0.0
+
+            swing_direction_score = 0.0
+            swing_trend = 0.0
+            if len(paths.get("bat", [])) >= 3:
+                bat_path = paths.get("bat", [])
+                p0 = bat_path[max(0, len(bat_path) - 3)]
+                p1 = bat_path[-1]
+                dx = float(p1[0] - p0[0])
+                dy = float(p1[1] - p0[1])
+                swing_direction_score = float(np.clip((-dy) / (abs(dx) + abs(dy) + 1e-6), -1.0, 1.0))
+                swing_trend = float(np.sign(-dy))
+
+            wrist_x, wrist_y = self._wrist_position_relative(frame_data[impact_idx].get("keypoints", {}))
+            impact_labels = {}
+            for i in range(len(features_by_frame)):
+                if i < impact_idx:
+                    impact_labels[i] = "pre-impact"
+                elif i == impact_idx:
+                    impact_labels[i] = "impact"
+                else:
+                    impact_labels[i] = "post-impact"
+
+            for i, f in enumerate(features_by_frame):
+                f["bat_angle_impact"] = bat_angle_impact
+                f["follow_through_height_max"] = follow_through_height_max
+                f["swing_direction_score"] = swing_direction_score
+                f["swing_trend"] = swing_trend
+                f["wrist_position_impact_x"] = wrist_x
+                f["wrist_position_impact_y"] = wrist_y
+                f["player_body_lean"] = float(f.get("body_lean", f.get("torso_tilt", 0.0)))
+                f["impact_phase"] = impact_labels.get(i, "post-impact")
+                if i == impact_idx:
+                    f["frame_weight"] = 2.4
+                elif i in key_indices:
+                    f["frame_weight"] = 1.6
+                else:
+                    f["frame_weight"] = 0.8
+
+        key_features = [
+            f
+            for f in features_by_frame
+            if str(f.get("impact_phase", "")).lower() in {"pre-impact", "impact", "post-impact"}
+            and float(f.get("frame_weight", 0.0)) >= 1.6
+        ]
         if not key_features:
             key_features = features_by_frame
 
@@ -171,3 +236,27 @@ class CricketAnalyticsPipeline:
         # Lightweight cache key to avoid repeated pose inference on near-identical frames.
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         return int(np.mean(gray)), int(np.std(gray))
+
+    @staticmethod
+    def _wrist_position_relative(keypoints: Dict[str, Tuple[float, float, float]]) -> Tuple[float, float]:
+        if not keypoints:
+            return 0.0, 0.0
+        required = {"left_wrist", "right_wrist", "left_hip", "right_hip", "left_shoulder", "right_shoulder"}
+        if any(k not in keypoints for k in required):
+            return 0.0, 0.0
+
+        l_wr = np.array(keypoints["left_wrist"][:2], dtype=np.float32)
+        r_wr = np.array(keypoints["right_wrist"][:2], dtype=np.float32)
+        wr_center = (l_wr + r_wr) / 2.0
+
+        l_hip = np.array(keypoints["left_hip"][:2], dtype=np.float32)
+        r_hip = np.array(keypoints["right_hip"][:2], dtype=np.float32)
+        body_center = (l_hip + r_hip) / 2.0
+
+        l_sh = np.array(keypoints["left_shoulder"][:2], dtype=np.float32)
+        r_sh = np.array(keypoints["right_shoulder"][:2], dtype=np.float32)
+        shoulder_span = float(np.linalg.norm(r_sh - l_sh)) + 1e-6
+
+        rel_x = float((wr_center[0] - body_center[0]) / shoulder_span)
+        rel_y = float((body_center[1] - wr_center[1]) / shoulder_span)
+        return rel_x, rel_y

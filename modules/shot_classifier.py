@@ -12,11 +12,18 @@ from sklearn.ensemble import RandomForestClassifier
 
 
 LABELS = ["defensive", "drive", "lofted", "pull", "cut", "sweep"]
-FEATURE_ORDER = [
+BASE_FEATURES = [
     "bat_swing_arc",
     "bat_angle",
+    "bat_angle_impact",
     "bat_follow_through_height",
     "follow_through_height",
+    "follow_through_height_max",
+    "swing_direction_score",
+    "swing_trend",
+    "wrist_position_impact_x",
+    "wrist_position_impact_y",
+    "player_body_lean",
     "shoulder_rotation",
     "elbow_angle",
     "body_lean",
@@ -28,18 +35,37 @@ FEATURE_ORDER = [
     "ball_direction",
     "pose_visibility",
     "motion_phase",
+    "frame_weight",
+]
+
+FEATURE_ORDER = BASE_FEATURES + [
     "elbow_angle_mean",
     "elbow_angle_max",
+    "elbow_angle_min",
     "elbow_angle_velocity",
+    "elbow_angle_peak",
+    "elbow_angle_trend",
     "shoulder_rotation_mean",
     "shoulder_rotation_max",
+    "shoulder_rotation_min",
     "shoulder_rotation_velocity",
+    "shoulder_rotation_peak",
+    "shoulder_rotation_trend",
     "wrist_trajectory_mean",
     "wrist_trajectory_max",
+    "wrist_trajectory_min",
     "wrist_trajectory_velocity",
+    "wrist_trajectory_peak",
+    "wrist_trajectory_trend",
     "body_lean_mean",
     "body_lean_max",
+    "body_lean_min",
     "body_lean_velocity",
+    "body_lean_peak",
+    "body_lean_trend",
+    "bat_velocity_peak",
+    "bat_velocity_trend",
+    "bat_angle_impact_mean",
 ]
 
 
@@ -58,18 +84,126 @@ def _window_average(series: Sequence[Dict[str, float]], window_size: int = 15) -
     temporal_keys = ["elbow_angle", "shoulder_rotation", "wrist_trajectory", "body_lean"]
     for i in range(0, len(series) - win + 1):
         chunk = series[i : i + win]
-        agg = {key: float(np.mean([s.get(key, 0.0) for s in chunk])) for key in FEATURE_ORDER}
+        weights = np.array([float(np.clip(s.get("frame_weight", 1.0), 0.25, 4.0)) for s in chunk], dtype=np.float32)
+        if float(np.sum(weights)) <= 1e-6:
+            weights = np.ones(len(chunk), dtype=np.float32)
+
+        agg = {}
+        for key in BASE_FEATURES:
+            arr = np.array([float(s.get(key, 0.0)) for s in chunk], dtype=np.float32)
+            agg[key] = float(np.average(arr, weights=weights)) if len(arr) else 0.0
+
         for key in temporal_keys:
             arr = np.array([float(s.get(key, 0.0)) for s in chunk], dtype=np.float32)
             agg[f"{key}_mean"] = float(np.mean(arr)) if len(arr) else 0.0
             agg[f"{key}_max"] = float(np.max(arr)) if len(arr) else 0.0
+            agg[f"{key}_min"] = float(np.min(arr)) if len(arr) else 0.0
             agg[f"{key}_velocity"] = float(np.mean(np.abs(np.diff(arr)))) if len(arr) >= 2 else 0.0
+            agg[f"{key}_peak"] = float(np.max(np.abs(np.diff(arr)))) if len(arr) >= 2 else 0.0
+            if len(arr) >= 2:
+                x = np.arange(len(arr), dtype=np.float32)
+                coeff = np.polyfit(x, arr, deg=1)
+                agg[f"{key}_trend"] = float(coeff[0])
+            else:
+                agg[f"{key}_trend"] = 0.0
+
+        bat_vel = np.array([float(s.get("bat_velocity", 0.0)) for s in chunk], dtype=np.float32)
+        agg["bat_velocity_peak"] = float(np.max(bat_vel)) if len(bat_vel) else 0.0
+        if len(bat_vel) >= 2:
+            xv = np.arange(len(bat_vel), dtype=np.float32)
+            coeff_v = np.polyfit(xv, bat_vel, deg=1)
+            agg["bat_velocity_trend"] = float(coeff_v[0])
+        else:
+            agg["bat_velocity_trend"] = 0.0
+
+        impact_angles = np.array([float(s.get("bat_angle_impact", s.get("bat_angle", 0.0)) for s in chunk)], dtype=np.float32)
+        agg["bat_angle_impact_mean"] = float(np.mean(impact_angles)) if len(impact_angles) else 0.0
         out.append(agg)
     return out
 
 
 def _vectorize(features: Dict[str, float], feature_order: Sequence[str]) -> np.ndarray:
     return np.array([float(features.get(k, 0.0)) for k in feature_order], dtype=np.float32)
+
+
+def _renormalize(prob_map: Dict[str, float]) -> Dict[str, float]:
+    total = float(sum(prob_map.values()))
+    if total <= 1e-9:
+        return prob_map
+    return {k: float(v / total) for k, v in prob_map.items()}
+
+
+def _extract_summary(feature_series: Sequence[Dict[str, float]]) -> Dict[str, float]:
+    if not feature_series:
+        return {}
+    arr = lambda key: np.array([float(f.get(key, 0.0)) for f in feature_series], dtype=np.float32)
+    summary = {
+        "follow_through_height_max": float(np.max(arr("follow_through_height_max"))),
+        "bat_angle_impact": float(np.mean(arr("bat_angle_impact"))),
+        "player_body_lean": float(np.mean(arr("player_body_lean"))),
+        "swing_direction_score": float(np.mean(arr("swing_direction_score"))),
+        "shoulder_rotation": float(np.mean(arr("shoulder_rotation"))),
+        "bat_velocity_peak": float(np.max(arr("bat_velocity"))),
+    }
+    return summary
+
+
+def _apply_soft_heuristics(prob_map: Dict[str, float], summary: Dict[str, float]) -> Tuple[Dict[str, float], List[str]]:
+    adjusted = dict(prob_map)
+    reasons: List[str] = []
+
+    follow_h = float(summary.get("follow_through_height_max", 0.0))
+    bat_ang = float(summary.get("bat_angle_impact", 0.0))
+    body_lean = float(summary.get("player_body_lean", 0.0))
+    swing_dir = float(summary.get("swing_direction_score", 0.0))
+    shoulder_rot = float(summary.get("shoulder_rotation", 0.0))
+
+    if follow_h > 0.18 and "lofted" in adjusted:
+        adjusted["lofted"] += 0.06
+        reasons.append("Boost lofted: high follow-through height")
+
+    if bat_ang < 22.0 and body_lean > 10.0 and "defensive" in adjusted:
+        adjusted["defensive"] += 0.05
+        reasons.append("Boost defensive: low bat angle and forward lean")
+
+    if abs(swing_dir) < 0.22 and shoulder_rot > 18.0 and "pull" in adjusted:
+        adjusted["pull"] += 0.05
+        reasons.append("Boost pull: horizontal swing with torso rotation")
+
+    return _renormalize(adjusted), reasons
+
+
+def _apply_tie_breaker(prob_map: Dict[str, float], summary: Dict[str, float]) -> Tuple[Dict[str, float], List[str], bool]:
+    ranked = sorted(prob_map.items(), key=lambda x: x[1], reverse=True)
+    if len(ranked) < 2:
+        return prob_map, [], False
+
+    top1, top2 = ranked[0], ranked[1]
+    diff_pct = (top1[1] - top2[1]) * 100.0
+    if diff_pct >= 10.0:
+        return prob_map, [], False
+
+    adjusted = dict(prob_map)
+    reasons: List[str] = [f"Top-2 gap {diff_pct:.2f}% < 10%; applying cricket tie-breaker"]
+
+    follow_h = float(summary.get("follow_through_height_max", 0.0))
+    bat_ang = float(summary.get("bat_angle_impact", 0.0))
+    swing_dir = float(summary.get("swing_direction_score", 0.0))
+
+    boost_label = top1[0]
+    if follow_h > 0.20:
+        boost_label = "lofted"
+        reasons.append("Tie-break favor lofted due to high follow-through")
+    elif bat_ang < 20.0:
+        boost_label = "defensive"
+        reasons.append("Tie-break favor defensive due to low impact bat angle")
+    elif abs(swing_dir) < 0.20:
+        boost_label = "pull"
+        reasons.append("Tie-break favor pull due to horizontal swing")
+
+    if boost_label in adjusted:
+        adjusted[boost_label] += 0.04
+    return _renormalize(adjusted), reasons, True
 
 
 def train_classifier(training_x: np.ndarray, training_y: np.ndarray, random_state: int = 42) -> Dict[str, object]:
@@ -142,6 +276,7 @@ def classify_shot_ml(
     window_size: int = 15,
     smooth_window: int = 7,
     low_conf_threshold: float | None = None,
+    debug: bool = False,
 ) -> Dict[str, object]:
     windows = _window_average(feature_series, window_size=window_size)
     if not windows:
@@ -176,10 +311,16 @@ def classify_shot_ml(
         smoothed_predictions.append(str(voted))
 
     avg_proba = np.mean(np.vstack(probabilities), axis=0)
-    best_label = Counter(smoothed_predictions).most_common(1)[0][0]
+    model_prob_map = {str(model.classes_[i]): float(avg_proba[i]) for i in range(len(avg_proba))}
+    summary = _extract_summary(feature_series)
+
+    adjusted_map, heuristic_reasons = _apply_soft_heuristics(model_prob_map, summary)
+    adjusted_map, tie_reasons, tie_applied = _apply_tie_breaker(adjusted_map, summary)
+
+    best_label = max(adjusted_map.items(), key=lambda x: x[1])[0]
     label_to_idx = {str(model.classes_[i]): i for i in range(len(model.classes_))}
     best_idx = label_to_idx.get(best_label, int(np.argmax(avg_proba)))
-    confidence_model = float(avg_proba[best_idx])
+    confidence_model = float(adjusted_map.get(best_label, avg_proba[best_idx]))
 
     consistency = float(smoothed_predictions.count(best_label) / max(1, len(smoothed_predictions)))
     pose_visibility = float(np.mean([f.get("pose_visibility", 0.0) for f in feature_series])) if feature_series else 0.0
@@ -193,7 +334,9 @@ def classify_shot_ml(
         )
     )
 
-    probability_map = {str(model.classes_[i]): round(float(avg_proba[i]) * 100.0, 2) for i in range(len(avg_proba))}
+    probability_map = {k: round(v * 100.0, 2) for k, v in sorted(adjusted_map.items(), key=lambda x: x[1], reverse=True)}
+    top3_before = sorted({str(model.classes_[i]): float(avg_proba[i]) for i in range(len(avg_proba))}.items(), key=lambda x: x[1], reverse=True)[:3]
+    top3_after = sorted(adjusted_map.items(), key=lambda x: x[1], reverse=True)[:3]
 
     low_conf_warning = ""
     if confidence * 100.0 < low_conf_threshold:
@@ -210,6 +353,13 @@ def classify_shot_ml(
             "pose_visibility_score": round(pose_visibility * 100.0, 2),
             "insight": "Model confidence below threshold. Try clearer camera angle and complete follow-through.",
             "low_confidence_warning": low_conf_warning,
+            "debug": {
+                "summary_features": summary,
+                "top3_before": [(k, round(v * 100.0, 2)) for k, v in top3_before],
+                "top3_after": [(k, round(v * 100.0, 2)) for k, v in top3_after],
+                "heuristic_reasons": heuristic_reasons + tie_reasons,
+                "tie_break_applied": tie_applied,
+            } if debug else {},
         }
 
     insight = {
@@ -231,6 +381,14 @@ def classify_shot_ml(
         "pose_visibility_score": round(pose_visibility * 100.0, 2),
         "insight": insight,
         "low_confidence_warning": low_conf_warning,
+        "debug": {
+            "summary_features": summary,
+            "top3_before": [(k, round(v * 100.0, 2)) for k, v in top3_before],
+            "top3_after": [(k, round(v * 100.0, 2)) for k, v in top3_after],
+            "heuristic_reasons": heuristic_reasons + tie_reasons,
+            "tie_break_applied": tie_applied,
+            "decision_reason": (heuristic_reasons + tie_reasons)[-1] if (heuristic_reasons or tie_reasons) else "ML probability dominated",
+        } if debug else {},
     }
 
 

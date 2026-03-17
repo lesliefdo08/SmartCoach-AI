@@ -8,8 +8,15 @@ import numpy as np
 FRAME_FEATURES = [
     "bat_swing_arc",
     "bat_angle",
+    "bat_angle_impact",
     "bat_follow_through_height",
     "follow_through_height",
+    "follow_through_height_max",
+    "swing_direction_score",
+    "swing_trend",
+    "wrist_position_impact_x",
+    "wrist_position_impact_y",
+    "player_body_lean",
     "shoulder_rotation",
     "elbow_angle",
     "body_lean",
@@ -25,14 +32,33 @@ FRAME_FEATURES = [
 
 
 def merge_features(object_features: Dict[str, float], pose_features: Dict[str, float]) -> Dict[str, float]:
+    follow_through_height = float(pose_features.get("follow_through_height", 0.0))
+    follow_through_height_max = float(
+        pose_features.get(
+            "follow_through_height_max",
+            max(
+                follow_through_height,
+                float(object_features.get("bat_follow_through_height", 0.0)),
+            ),
+        )
+    )
+    body_lean = float(pose_features.get("body_lean", pose_features.get("torso_tilt", 0.0)))
+
     merged = {
         "bat_swing_arc": float(object_features.get("bat_swing_arc", 0.0)),
         "bat_angle": float(object_features.get("bat_angle", 0.0)),
+        "bat_angle_impact": float(object_features.get("bat_angle_impact", object_features.get("bat_angle", 0.0))),
         "bat_follow_through_height": float(object_features.get("bat_follow_through_height", 0.0)),
-        "follow_through_height": float(pose_features.get("follow_through_height", 0.0)),
+        "follow_through_height": follow_through_height,
+        "follow_through_height_max": follow_through_height_max,
+        "swing_direction_score": float(object_features.get("swing_direction_score", 0.0)),
+        "swing_trend": float(object_features.get("swing_trend", 0.0)),
+        "wrist_position_impact_x": float(pose_features.get("wrist_position_impact_x", 0.0)),
+        "wrist_position_impact_y": float(pose_features.get("wrist_position_impact_y", 0.0)),
+        "player_body_lean": body_lean,
         "shoulder_rotation": float(pose_features.get("shoulder_rotation", pose_features.get("body_rotation", 0.0))),
         "elbow_angle": float(pose_features.get("elbow_angle", 0.0)),
-        "body_lean": float(pose_features.get("body_lean", pose_features.get("torso_tilt", 0.0))),
+        "body_lean": body_lean,
         "wrist_trajectory": float(pose_features.get("wrist_trajectory", 0.0)),
         "knee_bend": float(pose_features.get("knee_bend", 0.0)),
         "torso_tilt": float(pose_features.get("torso_tilt", 0.0)),
