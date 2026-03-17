@@ -36,3 +36,22 @@ assets/realtime_captures/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Model artifacts
+models/*.pkl
+models/*.joblib
+
+# Calibration and evaluation outputs (optional but recommended)
+models/*.json
+
+# Local database
+database/*.db
+
+# Python cache
+**pycache**/
+*.pyc
+
+# Environment files
+.env
+venv/
+.env/
