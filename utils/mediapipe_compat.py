@@ -7,8 +7,12 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 import urllib.request
 
-import mediapipe as mp
 import numpy as np
+
+try:
+    import mediapipe as mp
+except Exception:
+    mp = None
 
 
 Keypoint2D = Tuple[float, float, float]
@@ -50,6 +54,11 @@ class _PoseBackendBase:
 
     def close(self) -> None:
         pass
+
+
+class _NoopPoseBackend(_PoseBackendBase):
+    def detect_pose(self, image_rgb: np.ndarray) -> PoseDetectionResult:
+        return PoseDetectionResult({}, {}, 0.0)
 
 
 class _SolutionsPoseBackend(_PoseBackendBase):
@@ -171,6 +180,9 @@ def get_pose_model(
     model_asset_path: Optional[str] = None,
 ) -> _PoseBackendBase:
     """Get a pose model backend compatible across MediaPipe versions."""
+    if mp is None:
+        return _NoopPoseBackend()
+
     try:
         if hasattr(mp, "solutions") and hasattr(mp.solutions, "pose"):
             return _SolutionsPoseBackend(
