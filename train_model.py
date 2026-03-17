@@ -7,16 +7,39 @@ from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+import sklearn
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, precision_recall_fscore_support
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
-from modules.shot_classifier import FEATURE_ORDER, LABELS, save_classifier, save_classifier_versioned
+from modules.shot_classifier import FEATURE_ORDER, LABELS, NORMALIZE_FEATURES, save_classifier, save_classifier_versioned
 
 
 ROOT = Path(__file__).resolve().parent
 MODELS_DIR = ROOT / "models"
 LEGACY_MODEL_PATH = MODELS_DIR / "shot_classifier.pkl"
+
+
+def _normalize_indices(feature_order: Sequence[str]) -> List[int]:
+    return [i for i, name in enumerate(feature_order) if name in NORMALIZE_FEATURES]
+
+
+def _transform_selected(x: np.ndarray, scaler: StandardScaler | None, idx: Sequence[int]) -> np.ndarray:
+    if scaler is None or not idx:
+        return x
+    x_out = np.array(x, dtype=np.float32, copy=True)
+    x_out[:, list(idx)] = scaler.transform(x_out[:, list(idx)])
+    return x_out
+
+
+def _apply_feature_weights(x: np.ndarray, feature_order: Sequence[str], feature_weights: Dict[str, float]) -> np.ndarray:
+    x_out = np.array(x, dtype=np.float32, copy=True)
+    for i, name in enumerate(feature_order):
+        w = float(feature_weights.get(name, 1.0))
+        if abs(w - 1.0) > 1e-9:
+            x_out[:, i] = x_out[:, i] * w
+    return x_out
 
 
 def _augment_rows_if_small(df: pd.DataFrame, min_rows: int = 400, random_state: int = 42) -> pd.DataFrame:
@@ -98,9 +121,42 @@ def main() -> None:
         stratify=y,
     )
 
-    clf = _train_model(args.model, x_train, y_train, random_state=int(args.random_state))
-    y_pred = clf.predict(x_test)
-    y_proba = clf.predict_proba(x_test)
+    feature_weights: Dict[str, float] = {k: 1.0 for k in feature_order}
+    scaler = StandardScaler() if _normalize_indices(feature_order) else None
+    normalize_idx = _normalize_indices(feature_order)
+    if scaler is not None:
+        scaler.fit(x_train[:, normalize_idx])
+
+    x_train_w = _apply_feature_weights(x_train, feature_order, feature_weights)
+    x_test_w = _apply_feature_weights(x_test, feature_order, feature_weights)
+    x_train_t = _transform_selected(x_train_w, scaler, normalize_idx)
+    x_test_t = _transform_selected(x_test_w, scaler, normalize_idx)
+
+    clf = _train_model(args.model, x_train_t, y_train, random_state=int(args.random_state))
+
+    if hasattr(clf, "feature_importances_"):
+        importances = np.array(getattr(clf, "feature_importances_"), dtype=np.float32)
+        pairs = sorted(zip(feature_order, importances.tolist()), key=lambda x: x[1], reverse=True)
+        print("\nTop Feature Importances:")
+        for name, imp in pairs[:12]:
+            print(f"  {name:28s} {imp:.4f}")
+
+        med = float(np.median(importances)) if len(importances) else 0.0
+        key_focus = ["follow_through_height_max", "bat_angle_impact", "swing_direction_score", "player_body_lean"]
+        low_keys = [k for k in key_focus if k in feature_order and importances[feature_order.index(k)] < max(1e-6, 0.5 * med)]
+        if low_keys:
+            for k in low_keys:
+                feature_weights[k] = 1.15
+            print(f"\nAmplifying low-importance key features: {', '.join(low_keys)}")
+
+            x_train_w = _apply_feature_weights(x_train, feature_order, feature_weights)
+            x_test_w = _apply_feature_weights(x_test, feature_order, feature_weights)
+            x_train_t = _transform_selected(x_train_w, scaler, normalize_idx)
+            x_test_t = _transform_selected(x_test_w, scaler, normalize_idx)
+            clf = _train_model(args.model, x_train_t, y_train, random_state=int(args.random_state))
+
+    y_pred = clf.predict(x_test_t)
+    y_proba = clf.predict_proba(x_test_t)
 
     acc = float(accuracy_score(y_test, y_pred))
     prec, rec, f1, _ = precision_recall_fscore_support(y_test, y_pred, average="macro", zero_division=0)
@@ -131,10 +187,15 @@ def main() -> None:
         "model": clf,
         "labels": LABELS,
         "feature_order": feature_order,
+        "sklearn_version": sklearn.__version__,
         "calibration": {
             "low_confidence_threshold": round(low_conf_threshold, 2),
+            "tie_break_threshold": 9.0,
             "model_name": args.model,
         },
+        "scaler": scaler,
+        "normalize_indices": normalize_idx,
+        "feature_weights": feature_weights,
     }
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)

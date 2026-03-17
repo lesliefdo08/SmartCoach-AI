@@ -9,6 +9,7 @@ import joblib
 import numpy as np
 import sklearn
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
 
 
 LABELS = ["defensive", "drive", "lofted", "pull", "cut", "sweep"]
@@ -68,6 +69,13 @@ FEATURE_ORDER = BASE_FEATURES + [
     "bat_angle_impact_mean",
 ]
 
+NORMALIZE_FEATURES = [
+    "bat_angle_impact",
+    "follow_through_height_max",
+    "swing_direction_score",
+    "player_body_lean",
+]
+
 
 def _window_average(series: Sequence[Dict[str, float]], window_size: int = 15) -> List[Dict[str, float]]:
     if not series:
@@ -116,7 +124,7 @@ def _window_average(series: Sequence[Dict[str, float]], window_size: int = 15) -
         else:
             agg["bat_velocity_trend"] = 0.0
 
-        impact_angles = np.array([float(s.get("bat_angle_impact", s.get("bat_angle", 0.0)) for s in chunk)], dtype=np.float32)
+        impact_angles = np.array([float(s.get("bat_angle_impact", s.get("bat_angle", 0.0))) for s in chunk], dtype=np.float32)
         agg["bat_angle_impact_mean"] = float(np.mean(impact_angles)) if len(impact_angles) else 0.0
         out.append(agg)
     return out
@@ -124,6 +132,38 @@ def _window_average(series: Sequence[Dict[str, float]], window_size: int = 15) -
 
 def _vectorize(features: Dict[str, float], feature_order: Sequence[str]) -> np.ndarray:
     return np.array([float(features.get(k, 0.0)) for k in feature_order], dtype=np.float32)
+
+
+def _normalize_indices(feature_order: Sequence[str]) -> List[int]:
+    return [i for i, name in enumerate(feature_order) if name in NORMALIZE_FEATURES]
+
+
+def _fit_selected_scaler(x: np.ndarray, feature_order: Sequence[str]) -> tuple[StandardScaler | None, List[int]]:
+    idx = _normalize_indices(feature_order)
+    if not idx:
+        return None, []
+    scaler = StandardScaler()
+    scaler.fit(x[:, idx])
+    return scaler, idx
+
+
+def _transform_selected(x: np.ndarray, scaler: StandardScaler | None, idx: Sequence[int]) -> np.ndarray:
+    if scaler is None or not idx:
+        return x
+    x_out = np.array(x, dtype=np.float32, copy=True)
+    x_out[:, list(idx)] = scaler.transform(x_out[:, list(idx)])
+    return x_out
+
+
+def _apply_feature_weights(x: np.ndarray, feature_weights: Dict[str, float] | None, feature_order: Sequence[str]) -> np.ndarray:
+    if not feature_weights:
+        return x
+    x_out = np.array(x, dtype=np.float32, copy=True)
+    for i, name in enumerate(feature_order):
+        w = float(feature_weights.get(name, 1.0))
+        if abs(w - 1.0) > 1e-9:
+            x_out[:, i] = x_out[:, i] * w
+    return x_out
 
 
 def _renormalize(prob_map: Dict[str, float]) -> Dict[str, float]:
@@ -148,9 +188,27 @@ def _extract_summary(feature_series: Sequence[Dict[str, float]]) -> Dict[str, fl
     return summary
 
 
-def _apply_soft_heuristics(prob_map: Dict[str, float], summary: Dict[str, float]) -> Tuple[Dict[str, float], List[str]]:
+def _adaptive_boost_multiplier(model_confidence: float, calibration: Dict[str, object]) -> float:
+    low_gate = float(calibration.get("heuristic_low_conf_gate", 0.70))
+    high_gate = float(calibration.get("heuristic_high_conf_gate", 0.85))
+    low_factor = float(calibration.get("heuristic_low_conf_multiplier", 1.35))
+    high_factor = float(calibration.get("heuristic_high_conf_multiplier", 0.65))
+    if model_confidence < low_gate:
+        return low_factor
+    if model_confidence > high_gate:
+        return high_factor
+    return 1.0
+
+
+def _apply_soft_heuristics(
+    prob_map: Dict[str, float],
+    summary: Dict[str, float],
+    model_confidence: float,
+    calibration: Dict[str, object],
+) -> Tuple[Dict[str, float], List[str]]:
     adjusted = dict(prob_map)
     reasons: List[str] = []
+    mult = _adaptive_boost_multiplier(model_confidence, calibration)
 
     follow_h = float(summary.get("follow_through_height_max", 0.0))
     bat_ang = float(summary.get("bat_angle_impact", 0.0))
@@ -159,32 +217,42 @@ def _apply_soft_heuristics(prob_map: Dict[str, float], summary: Dict[str, float]
     shoulder_rot = float(summary.get("shoulder_rotation", 0.0))
 
     if follow_h > 0.18 and "lofted" in adjusted:
-        adjusted["lofted"] += 0.06
+        adjusted["lofted"] += 0.06 * mult
         reasons.append("Boost lofted: high follow-through height")
 
     if bat_ang < 22.0 and body_lean > 10.0 and "defensive" in adjusted:
-        adjusted["defensive"] += 0.05
+        adjusted["defensive"] += 0.05 * mult
         reasons.append("Boost defensive: low bat angle and forward lean")
 
     if abs(swing_dir) < 0.22 and shoulder_rot > 18.0 and "pull" in adjusted:
-        adjusted["pull"] += 0.05
+        adjusted["pull"] += 0.05 * mult
         reasons.append("Boost pull: horizontal swing with torso rotation")
+
+    if reasons:
+        reasons.append(f"Adaptive heuristic multiplier: {mult:.2f}")
 
     return _renormalize(adjusted), reasons
 
 
-def _apply_tie_breaker(prob_map: Dict[str, float], summary: Dict[str, float]) -> Tuple[Dict[str, float], List[str], bool]:
+def _apply_tie_breaker(
+    prob_map: Dict[str, float],
+    summary: Dict[str, float],
+    tie_break_threshold: float,
+    model_confidence: float,
+    calibration: Dict[str, object],
+) -> Tuple[Dict[str, float], List[str], bool]:
     ranked = sorted(prob_map.items(), key=lambda x: x[1], reverse=True)
     if len(ranked) < 2:
         return prob_map, [], False
 
     top1, top2 = ranked[0], ranked[1]
     diff_pct = (top1[1] - top2[1]) * 100.0
-    if diff_pct >= 10.0:
+    if diff_pct >= tie_break_threshold:
         return prob_map, [], False
 
     adjusted = dict(prob_map)
-    reasons: List[str] = [f"Top-2 gap {diff_pct:.2f}% < 10%; applying cricket tie-breaker"]
+    reasons: List[str] = [f"Top-2 gap {diff_pct:.2f}% < {tie_break_threshold:.2f}%; applying cricket tie-breaker"]
+    mult = _adaptive_boost_multiplier(model_confidence, calibration)
 
     follow_h = float(summary.get("follow_through_height_max", 0.0))
     bat_ang = float(summary.get("bat_angle_impact", 0.0))
@@ -202,11 +270,15 @@ def _apply_tie_breaker(prob_map: Dict[str, float], summary: Dict[str, float]) ->
         reasons.append("Tie-break favor pull due to horizontal swing")
 
     if boost_label in adjusted:
-        adjusted[boost_label] += 0.04
+        adjusted[boost_label] += 0.04 * mult
+    reasons.append(f"Adaptive tie-break multiplier: {mult:.2f}")
     return _renormalize(adjusted), reasons, True
 
 
 def train_classifier(training_x: np.ndarray, training_y: np.ndarray, random_state: int = 42) -> Dict[str, object]:
+    scaler, normalize_idx = _fit_selected_scaler(training_x, FEATURE_ORDER)
+    x_scaled = _transform_selected(training_x, scaler, normalize_idx)
+
     clf = RandomForestClassifier(
         n_estimators=300,
         max_depth=20,
@@ -214,12 +286,15 @@ def train_classifier(training_x: np.ndarray, training_y: np.ndarray, random_stat
         random_state=random_state,
         n_jobs=-1,
     )
-    clf.fit(training_x, training_y)
+    clf.fit(x_scaled, training_y)
     return {
         "model": clf,
         "labels": LABELS,
         "feature_order": FEATURE_ORDER,
         "sklearn_version": sklearn.__version__,
+        "scaler": scaler,
+        "normalize_indices": normalize_idx,
+        "feature_weights": {k: 1.0 for k in FEATURE_ORDER},
     }
 
 
@@ -276,6 +351,7 @@ def classify_shot_ml(
     window_size: int = 15,
     smooth_window: int = 7,
     low_conf_threshold: float | None = None,
+    tie_break_threshold: float | None = None,
     debug: bool = False,
 ) -> Dict[str, object]:
     windows = _window_average(feature_series, window_size=window_size)
@@ -293,11 +369,19 @@ def classify_shot_ml(
     calibration = model_bundle.get("calibration", {}) if isinstance(model_bundle, dict) else {}
     if low_conf_threshold is None:
         low_conf_threshold = float(calibration.get("low_confidence_threshold", 60.0))
+    if tie_break_threshold is None:
+        tie_break_threshold = float(calibration.get("tie_break_threshold", 10.0))
+
+    scaler: StandardScaler | None = model_bundle.get("scaler") if isinstance(model_bundle, dict) else None
+    normalize_idx = list(model_bundle.get("normalize_indices", _normalize_indices(model_feature_order))) if isinstance(model_bundle, dict) else _normalize_indices(model_feature_order)
+    feature_weights: Dict[str, float] = model_bundle.get("feature_weights", {}) if isinstance(model_bundle, dict) else {}
 
     probabilities = []
     frame_predictions: List[str] = []
     for w in windows:
         vec = _vectorize(w, model_feature_order).reshape(1, -1)
+        vec = _apply_feature_weights(vec, feature_weights, model_feature_order)
+        vec = _transform_selected(vec, scaler, normalize_idx)
         proba = model.predict_proba(vec)[0]
         probabilities.append(proba)
         pred_idx = int(np.argmax(proba))
@@ -313,9 +397,10 @@ def classify_shot_ml(
     avg_proba = np.mean(np.vstack(probabilities), axis=0)
     model_prob_map = {str(model.classes_[i]): float(avg_proba[i]) for i in range(len(avg_proba))}
     summary = _extract_summary(feature_series)
+    base_model_conf = float(np.max(avg_proba)) if len(avg_proba) else 0.0
 
-    adjusted_map, heuristic_reasons = _apply_soft_heuristics(model_prob_map, summary)
-    adjusted_map, tie_reasons, tie_applied = _apply_tie_breaker(adjusted_map, summary)
+    adjusted_map, heuristic_reasons = _apply_soft_heuristics(model_prob_map, summary, base_model_conf, calibration)
+    adjusted_map, tie_reasons, tie_applied = _apply_tie_breaker(adjusted_map, summary, float(tie_break_threshold), base_model_conf, calibration)
 
     best_label = max(adjusted_map.items(), key=lambda x: x[1])[0]
     label_to_idx = {str(model.classes_[i]): i for i in range(len(model.classes_))}
@@ -326,9 +411,29 @@ def classify_shot_ml(
     pose_visibility = float(np.mean([f.get("pose_visibility", 0.0) for f in feature_series])) if feature_series else 0.0
     valid_frames = sum(1 for f in feature_series if float(f.get("motion_phase", 0.0)) > 0.0 or float(f.get("pose_visibility", 0.0)) >= 0.35)
     valid_ratio = float(valid_frames / max(1, len(feature_series)))
+    motion_clarity = float(np.mean([abs(f.get("swing_direction_score", 0.0)) + abs(f.get("bat_velocity", 0.0)) * 0.05 for f in feature_series])) if feature_series else 0.0
+    motion_clarity = float(np.clip(motion_clarity, 0.0, 1.0))
+
+    missing_key_ratio = 0.0
+    if feature_series:
+        key_feats = ["bat_angle_impact", "follow_through_height_max", "swing_direction_score", "player_body_lean"]
+        missing = 0
+        total = len(feature_series) * len(key_feats)
+        for f in feature_series:
+            for k in key_feats:
+                if abs(float(f.get(k, 0.0))) < 1e-6:
+                    missing += 1
+        missing_key_ratio = float(missing / max(1, total))
+
     confidence = float(
         np.clip(
-            0.5 * confidence_model + 0.25 * consistency + 0.15 * pose_visibility + 0.10 * valid_ratio,
+            0.50 * confidence_model
+            + 0.20 * consistency
+            + 0.10 * pose_visibility
+            + 0.08 * valid_ratio
+            + 0.12 * motion_clarity
+            - 0.15 * (1.0 - consistency)
+            - 0.12 * missing_key_ratio,
             0.0,
             1.0,
         )
@@ -359,6 +464,9 @@ def classify_shot_ml(
                 "top3_after": [(k, round(v * 100.0, 2)) for k, v in top3_after],
                 "heuristic_reasons": heuristic_reasons + tie_reasons,
                 "tie_break_applied": tie_applied,
+                "tie_break_threshold": float(tie_break_threshold),
+                "missing_key_ratio": round(missing_key_ratio, 4),
+                "motion_clarity": round(motion_clarity, 4),
             } if debug else {},
         }
 
@@ -387,6 +495,9 @@ def classify_shot_ml(
             "top3_after": [(k, round(v * 100.0, 2)) for k, v in top3_after],
             "heuristic_reasons": heuristic_reasons + tie_reasons,
             "tie_break_applied": tie_applied,
+            "tie_break_threshold": float(tie_break_threshold),
+            "missing_key_ratio": round(missing_key_ratio, 4),
+            "motion_clarity": round(motion_clarity, 4),
             "decision_reason": (heuristic_reasons + tie_reasons)[-1] if (heuristic_reasons or tie_reasons) else "ML probability dominated",
         } if debug else {},
     }
