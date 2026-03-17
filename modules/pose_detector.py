@@ -138,12 +138,14 @@ def compute_pose_biomechanics(keypoints: Dict[str, Keypoint], bat_center: tuple[
             "elbow_angle": 0.0,
             "knee_bend": 0.0,
             "torso_tilt": 0.0,
+            "body_lean": 0.0,
             "head_alignment": 0.0,
             "bat_arm_alignment": 0.0,
             "follow_through_height": 0.0,
             "shoulder_rotation": 0.0,
             "body_rotation": 0.0,
             "head_position": 0.0,
+            "pose_visibility": 0.0,
         }
 
     l_sh = np.array(keypoints["left_shoulder"][:2], dtype=np.float32)
@@ -169,9 +171,14 @@ def compute_pose_biomechanics(keypoints: Dict[str, Keypoint], bat_center: tuple[
     knee_bend = float((left_knee + right_knee) / 2.0)
 
     hip_center = (l_hip + r_hip) / 2.0
+    sh_center = (l_sh + r_sh) / 2.0
     dx = float(abs(head[0] - hip_center[0]))
     dy = float(abs(head[1] - hip_center[1])) + 1e-6
     torso_tilt = float(np.degrees(np.arctan2(dx, dy)))
+
+    lean_dx = float(abs(sh_center[0] - hip_center[0]))
+    lean_dy = float(abs(sh_center[1] - hip_center[1])) + 1e-6
+    body_lean = float(np.degrees(np.arctan2(lean_dx, lean_dy)))
 
     shoulder_vec = r_sh - l_sh
     body_rotation = float(abs(np.degrees(np.arctan2(shoulder_vec[1], shoulder_vec[0]))))
@@ -180,7 +187,6 @@ def compute_pose_biomechanics(keypoints: Dict[str, Keypoint], bat_center: tuple[
     head_position = float(head_alignment)
 
     wr_center = (l_wr + r_wr) / 2.0
-    sh_center = (l_sh + r_sh) / 2.0
     arm_vec = wr_center - sh_center
     arm_angle = float(np.degrees(np.arctan2(-arm_vec[1], arm_vec[0])))
     bat_arm_alignment = 0.0
@@ -193,14 +199,19 @@ def compute_pose_biomechanics(keypoints: Dict[str, Keypoint], bat_center: tuple[
 
     follow_through_height = float((sh_center[1] - wr_center[1]) / (abs(sh_center[1]) + 1e-6))
 
+    visibility_vals = [float(v[2]) for v in keypoints.values() if len(v) >= 3]
+    pose_visibility = float(np.mean(visibility_vals)) if visibility_vals else 0.0
+
     return {
         "elbow_angle": round(elbow_angle, 3),
         "knee_bend": round(knee_bend, 3),
         "torso_tilt": round(torso_tilt, 3),
+        "body_lean": round(body_lean, 3),
         "head_alignment": round(head_alignment, 3),
         "bat_arm_alignment": round(float(np.clip(bat_arm_alignment, 0.0, 180.0)), 3),
         "follow_through_height": round(follow_through_height, 3),
         "shoulder_rotation": round(body_rotation, 3),
         "body_rotation": round(body_rotation, 3),
         "head_position": round(head_position, 3),
+        "pose_visibility": round(float(np.clip(pose_visibility, 0.0, 1.0)), 3),
     }

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -37,7 +37,10 @@ class CricketAnalyticsPipeline:
 
         frame_data: List[Dict[str, object]] = []
         features_by_frame: List[Dict[str, float]] = []
+        motion_scores: List[float] = []
         paths: Dict[str, List[tuple[int, int]]] = {"bat": [], "ball": []}
+        prev_wrist_center: Optional[np.ndarray] = None
+        pose_cache: Dict[Tuple[int, int], Dict[str, object]] = {}
 
         for idx, frame in enumerate(frames, start=1):
             frame = cv2.resize(frame, self.target_size, interpolation=cv2.INTER_AREA)
@@ -49,7 +52,14 @@ class CricketAnalyticsPipeline:
             paths = track_paths(paths, det)
             obj_features = movement_features(paths, frame_shape=frame.shape)
 
-            keypoints = self.pose_tracker.track_landmarks(rgb_norm)
+            frame_signature = self._frame_signature(frame)
+            cached_pose = pose_cache.get(frame_signature)
+            if cached_pose is None:
+                keypoints = self.pose_tracker.track_landmarks(rgb_norm)
+                cached_pose = {"keypoints": keypoints}
+                pose_cache[frame_signature] = cached_pose
+            else:
+                keypoints = cached_pose.get("keypoints", {})
 
             if strict_filter:
                 if not keypoints or bat_box is None or player_box is None:
@@ -66,7 +76,19 @@ class CricketAnalyticsPipeline:
                 bat_center = (int((x1 + x2) / 2), int((y1 + y2) / 2))
             pose_metrics = compute_pose_biomechanics(keypoints, bat_center=bat_center)
 
+            wrist_center = self._wrist_center(keypoints)
+            wrist_trajectory = 0.0
+            if wrist_center is not None and prev_wrist_center is not None:
+                wrist_trajectory = float(np.linalg.norm(wrist_center - prev_wrist_center))
+            if wrist_center is not None:
+                prev_wrist_center = wrist_center
+
+            pose_metrics["wrist_trajectory"] = round(wrist_trajectory, 3)
+            movement_score = float(abs(obj_features.get("bat_velocity", 0.0)) + wrist_trajectory)
+            motion_scores.append(movement_score)
+
             combined = merge_features(obj_features, pose_metrics)
+            combined["motion_score"] = round(movement_score, 3)
             features_by_frame.append(combined)
 
             frame_data.append(
@@ -81,12 +103,32 @@ class CricketAnalyticsPipeline:
                 }
             )
 
-        agg = sliding_window_average(features_by_frame, window_size=15)
+        if features_by_frame:
+            move_arr = np.array(motion_scores, dtype=np.float32)
+            start_threshold = float(max(1.5, np.percentile(move_arr, 40)))
+            peak_threshold = float(max(start_threshold * 1.8, np.percentile(move_arr, 85)))
+
+            for f in features_by_frame:
+                score = float(f.get("motion_score", 0.0))
+                if score < start_threshold:
+                    phase = 0.0
+                elif score >= peak_threshold:
+                    phase = 2.0
+                else:
+                    phase = 1.0
+                f["motion_phase"] = phase
+
+        key_features = [f for f in features_by_frame if float(f.get("motion_phase", 0.0)) > 0.0]
+        if not key_features:
+            key_features = features_by_frame
+
+        agg = sliding_window_average(key_features, window_size=15)
 
         return {
             "fps": fps,
             "frame_data": frame_data,
             "features_by_frame": features_by_frame,
+            "key_features": key_features,
             "window_features": agg,
             "bat_path": paths.get("bat", []),
             "ball_path": paths.get("ball", []),
@@ -94,3 +136,17 @@ class CricketAnalyticsPipeline:
 
     def close(self) -> None:
         self.pose_tracker.close()
+
+    @staticmethod
+    def _wrist_center(keypoints: Dict[str, Tuple[float, float, float]]) -> Optional[np.ndarray]:
+        if not keypoints or "left_wrist" not in keypoints or "right_wrist" not in keypoints:
+            return None
+        l_wr = np.array(keypoints["left_wrist"][:2], dtype=np.float32)
+        r_wr = np.array(keypoints["right_wrist"][:2], dtype=np.float32)
+        return (l_wr + r_wr) / 2.0
+
+    @staticmethod
+    def _frame_signature(frame_bgr: np.ndarray) -> Tuple[int, int]:
+        # Lightweight cache key to avoid repeated pose inference on near-identical frames.
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        return int(np.mean(gray)), int(np.std(gray))

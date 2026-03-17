@@ -16,6 +16,7 @@ from typing import Dict, List
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import sklearn
 
 from analytics.dashboard import (
     build_analysis_frames,
@@ -58,6 +59,7 @@ from database.database import init_database
 from modules.biomechanics import compute_biomechanics_frame, summarize_biomechanics
 from modules.session_manager import save_analysis_session
 from modules.shot_classifier import (
+    FEATURE_ORDER,
     build_training_matrices,
     classify_shot_ml,
     generate_contextual_feedback,
@@ -130,34 +132,67 @@ def _aggregate_features(frame_results: List[Dict[str, object]]) -> Dict[str, flo
 
 def _load_or_train_shot_model() -> Dict[str, object]:
     if MODEL_PATH.exists():
-        return load_classifier(MODEL_PATH)
+        bundle = load_classifier(MODEL_PATH)
+        existing_order = list(bundle.get("feature_order", []))
+        sklearn_version = str(bundle.get("sklearn_version", ""))
+        if existing_order and set(FEATURE_ORDER).issubset(set(existing_order)) and sklearn_version == sklearn.__version__:
+            return bundle
 
     rng = np.random.default_rng(42)
     priors = {
-        "defensive": [80, 68, 0.08, 0.05, 8, 155, 9, 20, 4, 15],
-        "drive": [130, 42, 0.14, 0.12, 14, 145, 12, 26, 7, 20],
-        "lofted": [220, 18, 0.24, 0.20, 18, 140, 14, 34, 11, 35],
-        "pull": [170, 5, 0.10, 0.09, 22, 135, 11, 30, 10, -5],
-        "cut": [160, -8, 0.09, 0.08, 24, 138, 10, 28, 9, -20],
-        "sweep": [145, -28, 0.07, 0.06, 16, 122, 7, 24, 8, -40],
+        "defensive": {
+            "bat_swing_arc": 80, "bat_angle": 68, "bat_follow_through_height": 0.08, "follow_through_height": 0.05,
+            "shoulder_rotation": 8, "elbow_angle": 150, "body_lean": 8, "wrist_trajectory": 2.8,
+            "knee_bend": 155, "torso_tilt": 9, "head_position": 20, "bat_velocity": 4, "ball_direction": 15,
+            "pose_visibility": 0.82, "motion_phase": 1.0,
+        },
+        "drive": {
+            "bat_swing_arc": 130, "bat_angle": 42, "bat_follow_through_height": 0.14, "follow_through_height": 0.12,
+            "shoulder_rotation": 14, "elbow_angle": 140, "body_lean": 11, "wrist_trajectory": 4.8,
+            "knee_bend": 145, "torso_tilt": 12, "head_position": 26, "bat_velocity": 7, "ball_direction": 20,
+            "pose_visibility": 0.80, "motion_phase": 1.5,
+        },
+        "lofted": {
+            "bat_swing_arc": 220, "bat_angle": 18, "bat_follow_through_height": 0.24, "follow_through_height": 0.20,
+            "shoulder_rotation": 18, "elbow_angle": 128, "body_lean": 16, "wrist_trajectory": 6.5,
+            "knee_bend": 140, "torso_tilt": 14, "head_position": 34, "bat_velocity": 11, "ball_direction": 35,
+            "pose_visibility": 0.78, "motion_phase": 2.0,
+        },
+        "pull": {
+            "bat_swing_arc": 170, "bat_angle": 5, "bat_follow_through_height": 0.10, "follow_through_height": 0.09,
+            "shoulder_rotation": 22, "elbow_angle": 132, "body_lean": 14, "wrist_trajectory": 5.6,
+            "knee_bend": 135, "torso_tilt": 11, "head_position": 30, "bat_velocity": 10, "ball_direction": -5,
+            "pose_visibility": 0.79, "motion_phase": 1.8,
+        },
+        "cut": {
+            "bat_swing_arc": 160, "bat_angle": -8, "bat_follow_through_height": 0.09, "follow_through_height": 0.08,
+            "shoulder_rotation": 24, "elbow_angle": 130, "body_lean": 13, "wrist_trajectory": 5.3,
+            "knee_bend": 138, "torso_tilt": 10, "head_position": 28, "bat_velocity": 9, "ball_direction": -20,
+            "pose_visibility": 0.78, "motion_phase": 1.8,
+        },
+        "sweep": {
+            "bat_swing_arc": 145, "bat_angle": -28, "bat_follow_through_height": 0.07, "follow_through_height": 0.06,
+            "shoulder_rotation": 16, "elbow_angle": 126, "body_lean": 15, "wrist_trajectory": 4.1,
+            "knee_bend": 122, "torso_tilt": 7, "head_position": 24, "bat_velocity": 8, "ball_direction": -40,
+            "pose_visibility": 0.77, "motion_phase": 1.6,
+        },
     }
-    keys = [
-        "bat_swing_arc",
-        "bat_angle",
-        "bat_follow_through_height",
-        "follow_through_height",
-        "shoulder_rotation",
-        "knee_bend",
-        "torso_tilt",
-        "head_position",
-        "bat_velocity",
-        "ball_direction",
-    ]
     samples = []
     for label, base in priors.items():
         for _ in range(280):
-            vals = rng.normal(loc=np.array(base, dtype=np.float32), scale=np.array([12, 10, 0.05, 0.04, 5, 10, 4, 8, 2, 10], dtype=np.float32))
-            samples.append(({k: float(v) for k, v in zip(keys, vals)}, label))
+            row = {k: 0.0 for k in FEATURE_ORDER}
+            for key, value in base.items():
+                scale = 0.05 * max(1.0, abs(float(value)))
+                row[key] = float(rng.normal(loc=float(value), scale=scale))
+
+            for key in ("elbow_angle", "shoulder_rotation", "wrist_trajectory", "body_lean"):
+                row[f"{key}_mean"] = row[key]
+                row[f"{key}_max"] = row[key] * float(rng.uniform(1.02, 1.25))
+                row[f"{key}_velocity"] = abs(row[key]) * float(rng.uniform(0.02, 0.08))
+
+            row["pose_visibility"] = float(np.clip(row["pose_visibility"], 0.2, 1.0))
+            row["motion_phase"] = float(np.clip(row["motion_phase"], 0.0, 2.0))
+            samples.append((row, label))
 
     x, y = build_training_matrices(samples)
     bundle = train_classifier(x, y)
@@ -315,9 +350,12 @@ def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_n
         st.warning("No valid frames were analyzed.")
         return None
 
-    shot_prediction = classify_shot_ml(out.get("window_features", []), shot_model, window_size=15)
+    shot_prediction = classify_shot_ml(out.get("key_features", out.get("features_by_frame", [])), shot_model, window_size=15)
     raw_shot = str(shot_prediction.get("shot_type", "Uncertain shot"))
     confidence_score = float(shot_prediction.get("confidence_score", 0.0))
+    low_conf_warning = str(shot_prediction.get("low_confidence_warning", ""))
+    if low_conf_warning:
+        st.warning(low_conf_warning)
     reference_key_map = {
         "defensive": "defense",
         "drive": "cover_drive",
@@ -480,6 +518,7 @@ def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_n
         "detected_shot": raw_shot,
         "confidence_score": confidence_score,
         "shot_prediction": shot_prediction,
+        "low_confidence_warning": low_conf_warning,
         "metrics": metrics,
         "score_card": score_card,
         "similarity_series": similarity_series,

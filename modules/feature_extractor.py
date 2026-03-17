@@ -11,11 +11,16 @@ FRAME_FEATURES = [
     "bat_follow_through_height",
     "follow_through_height",
     "shoulder_rotation",
+    "elbow_angle",
+    "body_lean",
+    "wrist_trajectory",
     "knee_bend",
     "torso_tilt",
     "head_position",
     "bat_velocity",
     "ball_direction",
+    "pose_visibility",
+    "motion_phase",
 ]
 
 
@@ -26,11 +31,16 @@ def merge_features(object_features: Dict[str, float], pose_features: Dict[str, f
         "bat_follow_through_height": float(object_features.get("bat_follow_through_height", 0.0)),
         "follow_through_height": float(pose_features.get("follow_through_height", 0.0)),
         "shoulder_rotation": float(pose_features.get("shoulder_rotation", pose_features.get("body_rotation", 0.0))),
+        "elbow_angle": float(pose_features.get("elbow_angle", 0.0)),
+        "body_lean": float(pose_features.get("body_lean", pose_features.get("torso_tilt", 0.0))),
+        "wrist_trajectory": float(pose_features.get("wrist_trajectory", 0.0)),
         "knee_bend": float(pose_features.get("knee_bend", 0.0)),
         "torso_tilt": float(pose_features.get("torso_tilt", 0.0)),
         "head_position": float(pose_features.get("head_position", 0.0)),
         "bat_velocity": float(object_features.get("bat_velocity", 0.0)),
         "ball_direction": float(object_features.get("ball_direction", 0.0)),
+        "pose_visibility": float(pose_features.get("pose_visibility", 0.0)),
+        "motion_phase": float(pose_features.get("motion_phase", 0.0)),
     }
     return merged
 
