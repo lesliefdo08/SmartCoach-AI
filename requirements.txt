@@ -3,6 +3,7 @@ opencv-python-headless==4.11.0.86
 numpy==1.26.4
 pandas
 matplotlib
+seaborn
 scikit-learn
 joblib
 yt-dlp
