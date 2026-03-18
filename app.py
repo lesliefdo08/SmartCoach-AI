@@ -10,6 +10,7 @@ from datetime import datetime
 import json
 import tempfile
 import threading
+import logging
 from pathlib import Path
 from typing import Dict, List
 
@@ -83,6 +84,12 @@ REFERENCE_DIR = ROOT_DIR / "reference_data"
 MODEL_DIR = ROOT_DIR / "models"
 MODEL_PATH = MODEL_DIR / "shot_classifier.pkl"
 MISTAKE_MODEL_PATH = ROOT_DIR / "assets" / "mistake_detector.pkl"
+ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv"}
+MAX_VIDEO_SIZE_BYTES = 300 * 1024 * 1024
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 
 def _load_reference_profile(shot_type: str) -> Dict[str, object]:
@@ -331,36 +338,207 @@ def _build_ball_tracking_from_path(ball_centers: List[tuple[int, int]], bat_path
     }
 
 
+def _empty_analysis_result(player_name: str = "Athlete") -> Dict[str, object]:
+    empty_df = pd.DataFrame()
+    return {
+        "status": "error",
+        "message": "Unable to analyze video properly",
+        "stage": "unknown",
+        "player_name": player_name,
+        "fps": 0.0,
+        "detected_shot": "Uncertain shot",
+        "confidence_score": 0.0,
+        "shot_prediction": {
+            "shot_type": "Uncertain shot",
+            "confidence_score": 0.0,
+            "probabilities": {},
+            "insight": "Insufficient data for analysis",
+            "low_confidence_warning": "Low confidence due to poor visibility or unstable camera",
+        },
+        "low_confidence_warning": "Low confidence due to poor visibility or unstable camera",
+        "metrics": {
+            "status": "insufficient_data",
+            "message": "Insufficient data for analysis",
+            "posture_accuracy_score": 0.0,
+            "joint_stability": 0.0,
+            "consistency_across_frames": 0.0,
+            "swing_efficiency": 0.0,
+            "bat_plane_consistency": 0.0,
+            "torso_rotation_power": 0.0,
+            "impact_alignment_score": 0.0,
+            "advanced_performance_score": 0.0,
+            "frames_analyzed": 0,
+            "per_joint_variability": {},
+        },
+        "score_card": {"technique": 0.0, "balance": 0.0, "consistency": 0.0, "overall": 0.0},
+        "similarity_series": [],
+        "avg_features": {},
+        "reference_features": {},
+        "final_feedback": {
+            "summary": "Insufficient data for analysis",
+            "tips": [
+                "Use a side-on camera angle.",
+                "Ensure full body and bat are visible.",
+                "Record in better lighting with steady camera.",
+            ],
+        },
+        "detected_mistakes": [],
+        "display_frames": [],
+        "features_df": empty_df,
+        "similarity_df": empty_df,
+        "deviation_df": empty_df,
+        "frame_table_df": empty_df,
+        "mistake_summary": {"top_mistakes": [], "suggestions": ["Collect clearer video for full analysis."]},
+        "biomechanics": {
+            "bat": {
+                "bat_path_coordinates": [],
+                "smoothed_bat_path": [],
+                "swing_speed_per_frame": [],
+                "swing_speed": 0.0,
+                "swing_arc_angle": 0.0,
+            },
+            "ball": {
+                "ball_trajectory": [],
+                "impact_point_estimate": None,
+                "bat_ball_alignment_score": 0.0,
+            },
+            "pose3d": {"torso_twist_series": [], "bat_swing_plane_series": []},
+        },
+        "advanced_projection_frames": [],
+        "last_frame_rgb": None,
+        "analysis_stats": {},
+    }
+
+
+def _fallback_analysis_result(
+    stage: str,
+    message: str,
+    player_name: str,
+    partial: Dict[str, object] | None = None,
+) -> Dict[str, object]:
+    payload = _empty_analysis_result(player_name=player_name)
+    payload["stage"] = stage
+    payload["message"] = message
+    if partial:
+        payload.update(partial)
+        payload["status"] = "partial" if partial.get("detected_shot") else "error"
+    return payload
+
+
+def _validate_uploaded_video(uploaded_video) -> tuple[bool, str]:
+    if uploaded_video is None:
+        return False, "No video selected."
+
+    name = str(getattr(uploaded_video, "name", "")).strip()
+    suffix = Path(name).suffix.lower()
+    if suffix not in ALLOWED_VIDEO_EXTENSIONS:
+        return False, "Unsupported video format. Please upload mp4, mov, avi, or mkv."
+
+    size = int(getattr(uploaded_video, "size", 0) or 0)
+    if size <= 0:
+        return False, "Uploaded file appears empty."
+    if size > MAX_VIDEO_SIZE_BYTES:
+        return False, "Video file is too large. Please upload a file under 300 MB."
+
+    return True, ""
+
+
+def _probe_video_file(video_path: str) -> tuple[bool, str]:
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            cap.release()
+            return False, "Unable to open uploaded video."
+        ok, _ = cap.read()
+        cap.release()
+        if not ok:
+            return False, "Video has no readable frames."
+        return True, ""
+    except Exception:
+        return False, "Uploaded file is not a valid video."
+
+
 def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_name: str) -> Dict[str, object] | None:
+    ok, validation_message = _validate_uploaded_video(uploaded_video)
+    if not ok:
+        logger.info("Upload validation failed: %s", validation_message)
+        st.error(validation_message)
+        return _fallback_analysis_result("input_validation", validation_message, player_name)
+
+    temp_path = ""
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
             temp_video.write(uploaded_video.read())
             temp_path = temp_video.name
     except Exception as exc:
-        st.error(f"Invalid or unreadable upload: {exc}")
-        return None
+        logger.exception("Stage upload_write failed: %s", exc)
+        return _fallback_analysis_result("upload_write", "Unable to read uploaded file.", player_name)
+
+    can_open, probe_message = _probe_video_file(temp_path)
+    if not can_open:
+        logger.info("Video probe failed: %s", probe_message)
+        st.error(probe_message)
+        return _fallback_analysis_result("video_probe", probe_message, player_name)
 
     try:
         shot_model = st.session_state.get("shot_model") or _load_or_train_shot_model()
         st.session_state.shot_model = shot_model
+    except Exception as exc:
+        logger.exception("Stage model_load failed: %s", exc)
+        return _fallback_analysis_result("model_load", "Unable to load analysis model.", player_name)
+
+    out: Dict[str, object] = {}
+    pipeline = None
+    try:
         pipeline = CricketAnalyticsPipeline(sample_rate=sample_rate, target_size=(854, 480))
         out = pipeline.process_video(temp_path)
-        pipeline.close()
     except Exception as exc:
-        st.error(f"Pipeline execution failed: {exc}")
-        return None
+        logger.exception("Stage pipeline_process failed: %s", exc)
+        return _fallback_analysis_result("pipeline_process", "Unable to analyze video properly", player_name)
+    finally:
+        if pipeline is not None:
+            try:
+                pipeline.close()
+            except Exception:
+                pass
 
-    frame_data = out.get("frame_data", [])
-    if not frame_data:
-        st.warning("No valid frames were analyzed.")
-        return None
+    frame_data = out.get("frame_data", []) if isinstance(out, dict) else []
+    features_by_frame = out.get("features_by_frame", []) if isinstance(out, dict) else []
+    analysis_stats = out.get("analysis_stats", {}) if isinstance(out, dict) else {}
+    valid_pose_frames = int(analysis_stats.get("valid_pose_frames", 0) or 0)
+    logger.info(
+        "Pipeline stats: frames_processed=%s valid_pose=%s quality_flags=%s",
+        len(frame_data),
+        valid_pose_frames,
+        analysis_stats.get("quality_flags", []),
+    )
 
-    shot_prediction = classify_shot_ml(out.get("key_features", out.get("features_by_frame", [])), shot_model, window_size=15)
+    if len(frame_data) == 0:
+        message = "Insufficient data for analysis"
+        st.warning("⚠️ Could not fully analyze this video. Try a clearer angle or better lighting.")
+        return _fallback_analysis_result(
+            "frame_validation",
+            message,
+            player_name,
+            partial={"analysis_stats": analysis_stats},
+        )
+
+    try:
+        shot_prediction = classify_shot_ml(out.get("key_features", features_by_frame), shot_model, window_size=15)
+    except Exception as exc:
+        logger.exception("Stage classification failed: %s", exc)
+        shot_prediction = {
+            "shot_type": "Uncertain shot",
+            "confidence_score": 0.0,
+            "probabilities": {},
+            "insight": "Unable to classify shot from available frames.",
+            "low_confidence_warning": "Low confidence due to poor visibility or unstable camera",
+        }
+
     raw_shot = str(shot_prediction.get("shot_type", "Uncertain shot"))
     confidence_score = float(shot_prediction.get("confidence_score", 0.0))
     low_conf_warning = str(shot_prediction.get("low_confidence_warning", ""))
-    if low_conf_warning:
-        st.warning(low_conf_warning)
+
     reference_key_map = {
         "defensive": "defense",
         "drive": "cover_drive",
@@ -373,12 +551,13 @@ def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_n
 
     try:
         reference_profile = _load_reference_profile(reference_shot)
+        reference_features = get_reference_means(reference_profile)
+        comparator = PoseComparator()
     except Exception as exc:
-        st.error(f"Reference profile loading failed: {exc}")
-        return None
-
-    reference_features = get_reference_means(reference_profile)
-    comparator = PoseComparator()
+        logger.warning("Stage reference_profile failed: %s", exc)
+        reference_profile = {}
+        reference_features = {}
+        comparator = None
 
     frame_results: List[Dict[str, object]] = []
     biomechanics_series: List[Dict[str, float]] = []
@@ -386,21 +565,28 @@ def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_n
     advanced_projection_frames: List[np.ndarray] = []
 
     for i, row in enumerate(frame_data, start=1):
-        features = row.get("features", {})
-        if not features:
+        features = row.get("features", {}) if isinstance(row, dict) else {}
+        if not isinstance(features, dict) or not features:
             continue
-        comparison = comparator.compare(features, reference_profile)
+
+        comparison = {"similarity_score": 0.0, "joint_errors": {}}
+        if comparator is not None and isinstance(reference_profile, dict):
+            try:
+                comparison = comparator.compare(features, reference_profile)
+            except Exception:
+                comparison = {"similarity_score": 0.0, "joint_errors": {}}
+
         frame_results.append(
             {
-                "frame_index": int(row["frame_index"]),
+                "frame_index": int(row.get("frame_index", i)),
                 "features": features,
-                "similarity_score": comparison["similarity_score"],
+                "similarity_score": float(comparison.get("similarity_score", 0.0)),
                 "comparison": comparison,
             }
         )
 
-        pose_metrics = row.get("pose_features", {})
-        if pose_metrics:
+        pose_metrics = row.get("pose_features", {}) if isinstance(row, dict) else {}
+        if isinstance(pose_metrics, dict) and pose_metrics:
             biomechanics_series.append(
                 {
                     "elbow_angle": float(pose_metrics.get("elbow_angle", 0.0)),
@@ -411,69 +597,52 @@ def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_n
             )
 
         if len(display_frames) < 8 and i % max(1, len(frame_data) // 8) == 0:
-            frame_bgr = row["frame_bgr"].copy()
-            overlay = draw_pose_overlay(
-                frame_bgr=frame_bgr,
-                keypoints=row.get("keypoints", {}),
-                joint_errors=comparison["joint_errors"],
-                angles=row.get("pose_features", {}),
-            )
-            det = row.get("detection", {})
-            for label, color in (("bat_box", (0, 255, 255)), ("ball_box", (0, 165, 255)), ("player_box", (255, 128, 0))):
-                box = det.get(label)
-                if box is not None:
-                    x1, y1, x2, y2 = box
-                    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(
-                overlay,
-                f"Shot: {raw_shot.replace('_', ' ').title()}",
-                (12, 24),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.62,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                overlay,
-                f"Confidence: {confidence_score:.1f}%",
-                (12, 48),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.58,
-                (76, 201, 240),
-                2,
-                cv2.LINE_AA,
-            )
-            display_frames.append(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
-            advanced_projection_frames.append(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+            try:
+                frame_bgr = row.get("frame_bgr", None)
+                if frame_bgr is None:
+                    continue
+                overlay = draw_pose_overlay(
+                    frame_bgr=frame_bgr.copy(),
+                    keypoints=row.get("keypoints", {}),
+                    joint_errors=comparison.get("joint_errors", {}),
+                    angles=row.get("pose_features", {}),
+                )
+                det = row.get("detection", {})
+                for label, color in (("bat_box", (0, 255, 255)), ("ball_box", (0, 165, 255)), ("player_box", (255, 128, 0))):
+                    box = det.get(label) if isinstance(det, dict) else None
+                    if box is not None:
+                        x1, y1, x2, y2 = box
+                        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(overlay, f"Shot: {raw_shot.replace('_', ' ').title()}", (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(overlay, f"Confidence: {confidence_score:.1f}%", (12, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (76, 201, 240), 2, cv2.LINE_AA)
+                display_frames.append(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+                advanced_projection_frames.append(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+            except Exception:
+                continue
 
-    if not frame_results:
-        st.warning("No valid feature frames found after extraction.")
-        return None
-
-    bat_path = out.get("bat_path", [])
-    ball_path = out.get("ball_path", [])
-    bat_tracking = _build_bat_tracking_from_path(bat_path)
-    ball_tracking = _build_ball_tracking_from_path(ball_path, bat_tracking.get("smoothed_bat_path", []))
+    bat_path = out.get("bat_path", []) if isinstance(out, dict) else []
+    ball_path = out.get("ball_path", []) if isinstance(out, dict) else []
+    bat_tracking = _build_bat_tracking_from_path(bat_path if isinstance(bat_path, list) else [])
+    ball_tracking = _build_ball_tracking_from_path(ball_path if isinstance(ball_path, list) else [], bat_tracking.get("smoothed_bat_path", []))
 
     biomechanics_data = {
         "bat": {
             **bat_tracking,
-            "swing_speed_per_frame": [float(f.get("bat_velocity", 0.0)) for f in out.get("features_by_frame", [])],
+            "swing_speed_per_frame": [float(f.get("bat_velocity", 0.0)) for f in features_by_frame if isinstance(f, dict)],
         },
         "ball": ball_tracking,
         "pose3d": {
-            "torso_twist_series": [float(f.get("torso_tilt", 0.0)) for f in out.get("features_by_frame", [])],
-            "bat_swing_plane_series": [float(f.get("bat_angle", 0.0)) for f in out.get("features_by_frame", [])],
+            "torso_twist_series": [float(f.get("torso_tilt", 0.0)) for f in features_by_frame if isinstance(f, dict)],
+            "bat_swing_plane_series": [float(f.get("bat_angle", 0.0)) for f in features_by_frame if isinstance(f, dict)],
         },
     }
 
     metrics = compute_performance_metrics(frame_results, biomechanics_data=biomechanics_data)
     bio_scores = summarize_biomechanics(biomechanics_series)
-    similarity_series = [fr["similarity_score"] for fr in frame_results]
+    similarity_series = [float(fr.get("similarity_score", 0.0)) for fr in frame_results]
     avg_features = _aggregate_features(frame_results)
     final_feedback = {
-        "summary": generate_contextual_feedback(shot_prediction, bio_scores, out.get("features_by_frame", [])),
+        "summary": generate_contextual_feedback(shot_prediction, bio_scores, features_by_frame),
         "tips": [
             "Keep head alignment stable over the ball line.",
             "Maintain knee flexion and avoid early body opening.",
@@ -481,16 +650,25 @@ def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_n
         ],
     }
 
-    features_df, similarity_df, deviation_df, frame_table_df = build_analysis_frames(frame_results, reference_features)
-    mistake_summary = summarize_mistakes_and_suggestions(deviation_df)
+    try:
+        features_df, similarity_df, deviation_df, frame_table_df = build_analysis_frames(frame_results, reference_features)
+        mistake_summary = summarize_mistakes_and_suggestions(deviation_df)
+    except Exception as exc:
+        logger.warning("Stage dataframe_build failed: %s", exc)
+        features_df = pd.DataFrame()
+        similarity_df = pd.DataFrame()
+        deviation_df = pd.DataFrame()
+        frame_table_df = pd.DataFrame()
+        mistake_summary = {"top_mistakes": [], "suggestions": ["Insufficient data for detailed mistake summary."]}
+
     score_card = {
-        "technique": bio_scores["technique_score"],
-        "balance": bio_scores["balance_score"],
-        "consistency": bio_scores["consistency_score"],
+        "technique": float(bio_scores.get("technique_score", 0.0)),
+        "balance": float(bio_scores.get("balance_score", 0.0)),
+        "consistency": float(bio_scores.get("consistency_score", 0.0)),
         "overall": round(
-            0.4 * bio_scores["technique_score"]
-            + 0.3 * bio_scores["balance_score"]
-            + 0.3 * bio_scores["consistency_score"],
+            0.4 * float(bio_scores.get("technique_score", 0.0))
+            + 0.3 * float(bio_scores.get("balance_score", 0.0))
+            + 0.3 * float(bio_scores.get("consistency_score", 0.0)),
             2,
         ),
     }
@@ -517,9 +695,18 @@ def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_n
     }
     st.session_state.session_history.append(session_entry)
 
-    return {
+    status = "ok"
+    message = "Analysis complete"
+    if len(frame_results) < 4 or metrics.get("status") != "ok":
+        status = "partial"
+        message = "Insufficient data for analysis"
+
+    result = {
+        "status": status,
+        "message": message,
+        "stage": "complete",
         "player_name": player_name,
-        "fps": float(out.get("fps", 0.0)),
+        "fps": float(out.get("fps", 0.0)) if isinstance(out, dict) else 0.0,
         "detected_shot": raw_shot,
         "confidence_score": confidence_score,
         "shot_prediction": shot_prediction,
@@ -540,7 +727,13 @@ def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_n
         "biomechanics": biomechanics_data,
         "advanced_projection_frames": advanced_projection_frames,
         "last_frame_rgb": display_frames[-1] if display_frames else None,
+        "analysis_stats": analysis_stats,
     }
+
+    if low_conf_warning or status == "partial":
+        st.warning("⚠️ Could not fully analyze this video. Try a clearer angle or better lighting.")
+
+    return result
 
 
 def _render_score_card(score_card: Dict[str, float]) -> None:
@@ -951,9 +1144,24 @@ def main() -> None:
         process_clicked = st.button("Process Video", type="primary", use_container_width=True)
 
         if process_clicked and uploaded_video is not None:
-            analysis = _run_video_analysis(uploaded_video, sample_rate, 1, player_name)
+            try:
+                analysis = _run_video_analysis(uploaded_video, sample_rate, 1, player_name)
+            except Exception as exc:
+                logger.exception("Unhandled analysis error: %s", exc)
+                st.warning("⚠️ Could not fully analyze this video. Try a clearer angle or better lighting.")
+                analysis = _fallback_analysis_result(
+                    stage="unhandled",
+                    message="Unable to analyze video properly",
+                    player_name=player_name,
+                )
+
             if analysis is not None:
-                st.session_state.last_analysis = analysis
+                status = str(analysis.get("status", "ok"))
+                if status in {"ok", "partial"}:
+                    st.session_state.last_analysis = analysis
+                if status == "error":
+                    st.warning("⚠️ Could not fully analyze this video. Try a clearer angle or better lighting.")
+                    st.info(str(analysis.get("message", "Unable to analyze video properly")))
 
         if st.session_state.last_analysis:
             _render_coaching_view(st.session_state.last_analysis)

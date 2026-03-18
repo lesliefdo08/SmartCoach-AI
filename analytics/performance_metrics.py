@@ -7,35 +7,54 @@ from typing import Dict, List
 import numpy as np
 
 
+def _default_metrics(message: str = "Insufficient data for analysis") -> Dict[str, object]:
+    return {
+        "status": "insufficient_data",
+        "message": message,
+        "posture_accuracy_score": 0.0,
+        "joint_stability": 0.0,
+        "consistency_across_frames": 0.0,
+        "swing_efficiency": 0.0,
+        "bat_plane_consistency": 0.0,
+        "torso_rotation_power": 0.0,
+        "impact_alignment_score": 0.0,
+        "advanced_performance_score": 0.0,
+        "frames_analyzed": 0,
+        "per_joint_variability": {},
+    }
+
+
 def compute_performance_metrics(
     frame_results: List[Dict[str, object]],
     biomechanics_data: Dict[str, object] | None = None,
 ) -> Dict[str, object]:
     """Compute posture accuracy, joint stability, and frame consistency."""
-    if not frame_results:
-        return {
-            "posture_accuracy_score": 0.0,
-            "joint_stability": 0.0,
-            "consistency_across_frames": 0.0,
-            "swing_efficiency": 0.0,
-            "bat_plane_consistency": 0.0,
-            "torso_rotation_power": 0.0,
-            "impact_alignment_score": 0.0,
-            "advanced_performance_score": 0.0,
-            "frames_analyzed": 0,
-            "per_joint_variability": {},
-        }
+    if not isinstance(frame_results, list) or not frame_results:
+        return _default_metrics("Insufficient data for analysis")
 
-    similarities = np.array([float(item.get("similarity_score", 0.0)) for item in frame_results], dtype=np.float32)
+    valid_results = [fr for fr in frame_results if isinstance(fr, dict)]
+    if not valid_results:
+        return _default_metrics("Insufficient data for analysis")
+
+    similarities = np.array([float(item.get("similarity_score", 0.0)) for item in valid_results], dtype=np.float32)
+    similarities = similarities[np.isfinite(similarities)]
+    if len(similarities) == 0:
+        similarities = np.array([0.0], dtype=np.float32)
     posture_accuracy = float(np.clip(np.mean(similarities), 0.0, 100.0))
 
     feature_keys = set()
-    for item in frame_results:
-        feature_keys.update(item.get("features", {}).keys())
+    for item in valid_results:
+        features = item.get("features", {})
+        if isinstance(features, dict):
+            feature_keys.update(features.keys())
 
     per_joint_std: Dict[str, float] = {}
     for key in sorted(feature_keys):
-        values = [item.get("features", {}).get(key, np.nan) for item in frame_results]
+        values = []
+        for item in valid_results:
+            features = item.get("features", {})
+            if isinstance(features, dict):
+                values.append(features.get(key, np.nan))
         arr = np.array(values, dtype=np.float32)
         arr = arr[np.isfinite(arr)]
         if len(arr) > 1:
@@ -53,6 +72,8 @@ def compute_performance_metrics(
     advanced = _compute_advanced_metrics(biomechanics_data or {})
 
     return {
+        "status": "ok",
+        "message": "Metrics computed",
         "posture_accuracy_score": round(posture_accuracy, 2),
         "joint_stability": round(joint_stability, 2),
         "consistency_across_frames": round(consistency, 2),
@@ -61,7 +82,7 @@ def compute_performance_metrics(
         "torso_rotation_power": advanced["torso_rotation_power"],
         "impact_alignment_score": advanced["impact_alignment_score"],
         "advanced_performance_score": advanced["advanced_performance_score"],
-        "frames_analyzed": len(frame_results),
+        "frames_analyzed": len(valid_results),
         "per_joint_variability": {k: round(v, 2) for k, v in per_joint_std.items()},
     }
 
@@ -73,8 +94,10 @@ def _compute_advanced_metrics(biomechanics_data: Dict[str, object]) -> Dict[str,
 
     swing_speed = float(bat.get("swing_speed", 0.0))
     arc_angle = float(bat.get("swing_arc_angle", 0.0))
-    plane_series = np.array(bio3d.get("bat_swing_plane_series", []), dtype=np.float32)
-    torso_series = np.array(bio3d.get("torso_twist_series", []), dtype=np.float32)
+    plane_series = np.array(bio3d.get("bat_swing_plane_series", []) if isinstance(bio3d, dict) else [], dtype=np.float32)
+    torso_series = np.array(bio3d.get("torso_twist_series", []) if isinstance(bio3d, dict) else [], dtype=np.float32)
+    plane_series = plane_series[np.isfinite(plane_series)]
+    torso_series = torso_series[np.isfinite(torso_series)]
     impact_alignment = float(ball.get("bat_ball_alignment_score", 0.0))
 
     # Heuristic scoring transforms to 0-100

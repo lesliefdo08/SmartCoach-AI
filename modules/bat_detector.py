@@ -30,15 +30,16 @@ class YOLOBatBallDetector:
                 "bat_box": None,
                 "ball_box": None,
                 "player_box": None,
+                "player_count": 0,
             }
 
         results = self._model.predict(source=frame_bgr, conf=self.conf_threshold, verbose=False)
         if not results:
-            return {"bat_box": None, "ball_box": None, "player_box": None}
+            return {"bat_box": None, "ball_box": None, "player_box": None, "player_count": 0}
 
         r = results[0]
         if r.boxes is None or len(r.boxes) == 0:
-            return {"bat_box": None, "ball_box": None, "player_box": None}
+            return {"bat_box": None, "ball_box": None, "player_box": None, "player_count": 0}
 
         names = r.names if hasattr(r, "names") else {}
         bat_box: BBox | None = None
@@ -47,6 +48,7 @@ class YOLOBatBallDetector:
         bat_conf = -1.0
         ball_conf = -1.0
         person_conf = -1.0
+        person_count = 0
 
         for box in r.boxes:
             cls_id = int(box.cls.item())
@@ -61,13 +63,17 @@ class YOLOBatBallDetector:
                 ball_conf = conf
                 ball_box = (x1, y1, x2, y2)
             elif label == "person" and conf > person_conf:
+                person_count += 1
                 person_conf = conf
                 player_box = (x1, y1, x2, y2)
+            elif label == "person":
+                person_count += 1
 
         return {
             "bat_box": bat_box,
             "ball_box": ball_box,
             "player_box": player_box,
+            "player_count": int(person_count),
         }
 
 

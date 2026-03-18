@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -12,6 +13,9 @@ from core.video_processor import extract_frames, load_video
 from modules.bat_detector import YOLOBatBallDetector, movement_features, track_paths
 from modules.feature_extractor import merge_features, sliding_window_average
 from modules.pose_detector import CricketPoseTracker, compute_pose_biomechanics
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -37,9 +41,39 @@ class CricketAnalyticsPipeline:
         strict_filter: bool = False,
         min_player_area_ratio: float = 0.25,
     ) -> Dict[str, object]:
-        cap = load_video(str(video_path))
-        frames, fps = extract_frames(cap, sample_rate=max(1, self.sample_rate))
-        cap.release()
+        stats = {
+            "frames_total": 0,
+            "frames_processed": 0,
+            "valid_pose_frames": 0,
+            "player_detected_frames": 0,
+            "multi_player_frames": 0,
+            "blurry_frames": 0,
+            "quality_flags": [],
+        }
+
+        try:
+            cap = load_video(str(video_path))
+            frames, fps = extract_frames(cap, sample_rate=max(1, self.sample_rate))
+            cap.release()
+        except Exception as exc:
+            logger.warning("Video loading/extraction failed for %s: %s", video_path, exc)
+            return {
+                "status": "error",
+                "stage": "frame_extraction",
+                "message": "Unable to extract frames from video",
+                "fps": 0.0,
+                "frame_data": [],
+                "features_by_frame": [],
+                "key_features": [],
+                "window_features": [],
+                "bat_path": [],
+                "ball_path": [],
+                "analysis_stats": stats,
+            }
+
+        stats["frames_total"] = int(len(frames))
+        if len(frames) < 6:
+            stats["quality_flags"].append("short_video")
 
         frame_data: List[Dict[str, object]] = []
         features_by_frame: List[Dict[str, float]] = []
@@ -49,23 +83,45 @@ class CricketAnalyticsPipeline:
         pose_cache: Dict[Tuple[int, int], Dict[str, object]] = {}
 
         for idx, frame in enumerate(frames, start=1):
-            frame = cv2.resize(frame, self.target_size, interpolation=cv2.INTER_AREA)
+            try:
+                frame = cv2.resize(frame, self.target_size, interpolation=cv2.INTER_AREA)
+            except Exception:
+                continue
+
+            blur_score = float(cv2.Laplacian(frame, cv2.CV_64F).var())
+            if blur_score < 35.0:
+                stats["blurry_frames"] += 1
+
             rgb_norm = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
-            det = self.detector.detect(frame)
+            try:
+                det = self.detector.detect(frame)
+            except Exception:
+                det = {"bat_box": None, "ball_box": None, "player_box": None, "player_count": 0}
             player_box = det.get("player_box")
             bat_box = det.get("bat_box")
+            player_count = int(det.get("player_count", 0) or 0)
+            if player_box is not None:
+                stats["player_detected_frames"] += 1
+            if player_count > 1:
+                stats["multi_player_frames"] += 1
             paths = track_paths(paths, det)
             obj_features = movement_features(paths, frame_shape=frame.shape)
 
             frame_signature = self._frame_signature(frame)
             cached_pose = pose_cache.get(frame_signature)
             if cached_pose is None:
-                keypoints = self.pose_tracker.track_landmarks(rgb_norm)
+                try:
+                    keypoints = self.pose_tracker.track_landmarks(rgb_norm)
+                except Exception:
+                    keypoints = {}
                 cached_pose = {"keypoints": keypoints}
                 pose_cache[frame_signature] = cached_pose
             else:
                 keypoints = cached_pose.get("keypoints", {})
+
+            if keypoints:
+                stats["valid_pose_frames"] += 1
 
             if strict_filter:
                 if not keypoints or bat_box is None or player_box is None:
@@ -108,6 +164,7 @@ class CricketAnalyticsPipeline:
                     "features": combined,
                 }
             )
+            stats["frames_processed"] += 1
 
         if features_by_frame:
             move_arr = np.array(motion_scores, dtype=np.float32)
@@ -193,9 +250,21 @@ class CricketAnalyticsPipeline:
         if not key_features:
             key_features = features_by_frame
 
+        if stats["valid_pose_frames"] == 0:
+            stats["quality_flags"].append("no_pose_detected")
+        if stats["player_detected_frames"] == 0:
+            stats["quality_flags"].append("no_player_detected")
+        if stats["multi_player_frames"] > 0:
+            stats["quality_flags"].append("multiple_players_detected")
+        if stats["blurry_frames"] > max(3, int(0.4 * max(1, stats["frames_total"]))):
+            stats["quality_flags"].append("blurry_video")
+
         agg = sliding_window_average(key_features, window_size=15)
 
         return {
+            "status": "ok",
+            "stage": "complete",
+            "message": "Video processed",
             "fps": fps,
             "frame_data": frame_data,
             "features_by_frame": features_by_frame,
@@ -203,6 +272,7 @@ class CricketAnalyticsPipeline:
             "window_features": agg,
             "bat_path": paths.get("bat", []),
             "ball_path": paths.get("ball", []),
+            "analysis_stats": stats,
         }
 
     def close(self) -> None:
