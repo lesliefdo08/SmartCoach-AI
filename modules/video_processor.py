@@ -11,7 +11,7 @@ import numpy as np
 
 from core.video_processor import extract_frames, load_video
 from modules.bat_detector import YOLOBatBallDetector, movement_features, track_paths
-from modules.feature_extractor import merge_features, sliding_window_average
+from modules.feature_extractor import fill_missing_features, merge_features, sliding_window_average
 from modules.pose_detector import CricketPoseTracker, compute_pose_biomechanics
 
 
@@ -45,9 +45,12 @@ class CricketAnalyticsPipeline:
             "frames_total": 0,
             "frames_processed": 0,
             "valid_pose_frames": 0,
+            "valid_frames": 0,
             "player_detected_frames": 0,
             "multi_player_frames": 0,
+            "frames_with_bat": 0,
             "blurry_frames": 0,
+            "fallback_impact_used": False,
             "quality_flags": [],
         }
 
@@ -103,6 +106,8 @@ class CricketAnalyticsPipeline:
             player_count = int(det.get("player_count", 0) or 0)
             if player_box is not None:
                 stats["player_detected_frames"] += 1
+            if bat_box is not None:
+                stats["frames_with_bat"] += 1
             if player_count > 1:
                 stats["multi_player_frames"] += 1
             paths = track_paths(paths, det)
@@ -123,14 +128,24 @@ class CricketAnalyticsPipeline:
             if keypoints:
                 stats["valid_pose_frames"] += 1
 
+            pose_confidence = 0.0
+            if keypoints:
+                vis_vals = [float(v[2]) for v in keypoints.values() if len(v) >= 3]
+                pose_confidence = float(np.mean(vis_vals)) if vis_vals else 0.0
+            bat_confidence = float(det.get("bat_confidence", 1.0 if bat_box is not None else 0.0))
+            if pose_confidence > 0.0 or bat_confidence > 0.0:
+                stats["valid_frames"] += 1
+
             if strict_filter:
-                if not keypoints or bat_box is None or player_box is None:
+                # Relaxed strict filter: keep frame when either pose or bat is detected.
+                if (not keypoints) and bat_box is None:
                     continue
-                x1, y1, x2, y2 = player_box
-                player_area = max(0, x2 - x1) * max(0, y2 - y1)
-                frame_area = frame.shape[0] * frame.shape[1]
-                if frame_area <= 0 or (player_area / frame_area) < min_player_area_ratio:
-                    continue
+                if player_box is not None:
+                    x1, y1, x2, y2 = player_box
+                    player_area = max(0, x2 - x1) * max(0, y2 - y1)
+                    frame_area = frame.shape[0] * frame.shape[1]
+                    if frame_area > 0 and (player_area / frame_area) < min_player_area_ratio and not keypoints:
+                        continue
 
             bat_center = None
             if bat_box is not None:
@@ -146,10 +161,12 @@ class CricketAnalyticsPipeline:
                 prev_wrist_center = wrist_center
 
             pose_metrics["wrist_trajectory"] = round(wrist_trajectory, 3)
+            pose_metrics["pose_confidence"] = round(float(np.clip(pose_confidence, 0.0, 1.0)), 3)
             movement_score = float(abs(obj_features.get("bat_velocity", 0.0)) + wrist_trajectory)
             motion_scores.append(movement_score)
+            obj_features["bat_confidence"] = round(float(np.clip(bat_confidence, 0.0, 1.0)), 3)
 
-            combined = merge_features(obj_features, pose_metrics)
+            combined = fill_missing_features(merge_features(obj_features, pose_metrics))
             combined["motion_score"] = round(movement_score, 3)
             features_by_frame.append(combined)
 
@@ -188,7 +205,21 @@ class CricketAnalyticsPipeline:
                 direction_change[1:] = np.abs(np.diff(bat_angle))
 
             impact_score = bat_vel + 0.75 * direction_change
-            impact_idx = int(np.argmax(impact_score)) if len(impact_score) else 0
+            fallback_used = False
+            if len(impact_score) == 0:
+                impact_idx = max(0, len(features_by_frame) // 2)
+                fallback_used = True
+            else:
+                max_score = float(np.max(impact_score))
+                if max_score <= 1e-6:
+                    if len(move_arr) > 0 and float(np.max(move_arr)) > 1e-6:
+                        impact_idx = int(np.argmax(move_arr))
+                    else:
+                        impact_idx = max(0, len(features_by_frame) // 2)
+                    fallback_used = True
+                else:
+                    impact_idx = int(np.argmax(impact_score))
+            stats["fallback_impact_used"] = bool(fallback_used)
 
             pre_start = max(0, impact_idx - 2)
             pre_end = max(0, impact_idx - 1)
@@ -249,6 +280,9 @@ class CricketAnalyticsPipeline:
         ]
         if not key_features:
             key_features = features_by_frame
+
+        if int(stats.get("valid_frames", 0)) < 5:
+            stats["quality_flags"].append("low_valid_frames")
 
         if stats["valid_pose_frames"] == 0:
             stats["quality_flags"].append("no_pose_detected")

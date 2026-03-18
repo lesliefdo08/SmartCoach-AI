@@ -35,6 +35,8 @@ BASE_FEATURES = [
     "bat_velocity",
     "ball_direction",
     "pose_visibility",
+    "pose_confidence",
+    "bat_confidence",
     "motion_phase",
     "frame_weight",
 ]
@@ -184,6 +186,8 @@ def _extract_summary(feature_series: Sequence[Dict[str, float]]) -> Dict[str, fl
         "swing_direction_score": float(np.mean(arr("swing_direction_score"))),
         "shoulder_rotation": float(np.mean(arr("shoulder_rotation"))),
         "bat_velocity_peak": float(np.max(arr("bat_velocity"))),
+        "pose_confidence": float(np.mean(arr("pose_confidence"))),
+        "bat_confidence": float(np.mean(arr("bat_confidence"))),
     }
     return summary
 
@@ -425,6 +429,12 @@ def classify_shot_ml(
                     missing += 1
         missing_key_ratio = float(missing / max(1, total))
 
+    low_frame_penalty = 0.0
+    if valid_frames < 5:
+        low_frame_penalty = float(np.clip((5 - valid_frames) / 5.0, 0.0, 1.0))
+
+    weak_signal_penalty = float(np.clip(1.0 - 0.5 * (summary.get("pose_confidence", 0.0) + summary.get("bat_confidence", 0.0)), 0.0, 1.0))
+
     confidence = float(
         np.clip(
             0.50 * confidence_model
@@ -433,7 +443,9 @@ def classify_shot_ml(
             + 0.08 * valid_ratio
             + 0.12 * motion_clarity
             - 0.15 * (1.0 - consistency)
-            - 0.12 * missing_key_ratio,
+            - 0.12 * missing_key_ratio
+            - 0.10 * low_frame_penalty
+            - 0.08 * weak_signal_penalty,
             0.0,
             1.0,
         )
@@ -446,29 +458,6 @@ def classify_shot_ml(
     low_conf_warning = ""
     if confidence * 100.0 < low_conf_threshold:
         low_conf_warning = "Low confidence due to poor visibility or unstable camera"
-
-    if confidence < 0.4:
-        return {
-            "shot_type": "Uncertain shot",
-            "confidence_score": round(confidence * 100.0, 2),
-            "probabilities": probability_map,
-            "consistency_score": round(consistency * 100.0, 2),
-            "valid_frame_count": int(valid_frames),
-            "valid_frame_ratio": round(valid_ratio * 100.0, 2),
-            "pose_visibility_score": round(pose_visibility * 100.0, 2),
-            "insight": "Model confidence below threshold. Try clearer camera angle and complete follow-through.",
-            "low_confidence_warning": low_conf_warning,
-            "debug": {
-                "summary_features": summary,
-                "top3_before": [(k, round(v * 100.0, 2)) for k, v in top3_before],
-                "top3_after": [(k, round(v * 100.0, 2)) for k, v in top3_after],
-                "heuristic_reasons": heuristic_reasons + tie_reasons,
-                "tie_break_applied": tie_applied,
-                "tie_break_threshold": float(tie_break_threshold),
-                "missing_key_ratio": round(missing_key_ratio, 4),
-                "motion_clarity": round(motion_clarity, 4),
-            } if debug else {},
-        }
 
     insight = {
         "defensive": "Compact bat path and controlled body posture suggest a defensive shot.",
@@ -498,6 +487,8 @@ def classify_shot_ml(
             "tie_break_threshold": float(tie_break_threshold),
             "missing_key_ratio": round(missing_key_ratio, 4),
             "motion_clarity": round(motion_clarity, 4),
+            "low_frame_penalty": round(low_frame_penalty, 4),
+            "weak_signal_penalty": round(weak_signal_penalty, 4),
             "decision_reason": (heuristic_reasons + tie_reasons)[-1] if (heuristic_reasons or tie_reasons) else "ML probability dominated",
         } if debug else {},
     }

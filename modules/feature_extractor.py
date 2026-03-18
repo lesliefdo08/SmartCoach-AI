@@ -27,6 +27,8 @@ FRAME_FEATURES = [
     "bat_velocity",
     "ball_direction",
     "pose_visibility",
+    "pose_confidence",
+    "bat_confidence",
     "motion_phase",
 ]
 
@@ -66,9 +68,18 @@ def merge_features(object_features: Dict[str, float], pose_features: Dict[str, f
         "bat_velocity": float(object_features.get("bat_velocity", 0.0)),
         "ball_direction": float(object_features.get("ball_direction", 0.0)),
         "pose_visibility": float(pose_features.get("pose_visibility", 0.0)),
+        "pose_confidence": float(pose_features.get("pose_confidence", pose_features.get("pose_visibility", 0.0))),
+        "bat_confidence": float(object_features.get("bat_confidence", 0.0)),
         "motion_phase": float(pose_features.get("motion_phase", 0.0)),
     }
     return merged
+
+
+def fill_missing_features(features: Dict[str, float]) -> Dict[str, float]:
+    out = dict(features) if isinstance(features, dict) else {}
+    for key in FRAME_FEATURES:
+        out[key] = float(out.get(key, 0.0))
+    return out
 
 
 def sliding_window_average(features_by_frame: List[Dict[str, float]], window_size: int = 15) -> List[Dict[str, float]]:

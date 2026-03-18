@@ -507,15 +507,17 @@ def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_n
     analysis_stats = out.get("analysis_stats", {}) if isinstance(out, dict) else {}
     valid_pose_frames = int(analysis_stats.get("valid_pose_frames", 0) or 0)
     logger.info(
-        "Pipeline stats: frames_processed=%s valid_pose=%s quality_flags=%s",
+        "Pipeline stats: total_frames=%s frames_processed=%s valid_pose=%s fallback_impact=%s quality_flags=%s",
+        analysis_stats.get("frames_total", 0),
         len(frame_data),
         valid_pose_frames,
+        analysis_stats.get("fallback_impact_used", False),
         analysis_stats.get("quality_flags", []),
     )
 
     if len(frame_data) == 0:
         message = "Insufficient data for analysis"
-        st.warning("⚠️ Could not fully analyze this video. Try a clearer angle or better lighting.")
+        st.warning("⚠️ Unable to process this video. Try a clearer recording.")
         return _fallback_analysis_result(
             "frame_validation",
             message,
@@ -731,7 +733,7 @@ def _run_video_analysis(uploaded_video, sample_rate: int, user_id: int, player_n
     }
 
     if low_conf_warning or status == "partial":
-        st.warning("⚠️ Could not fully analyze this video. Try a clearer angle or better lighting.")
+        st.warning("⚠️ Analysis completed with limited data. Results may be less accurate.")
 
     return result
 
@@ -1148,7 +1150,7 @@ def main() -> None:
                 analysis = _run_video_analysis(uploaded_video, sample_rate, 1, player_name)
             except Exception as exc:
                 logger.exception("Unhandled analysis error: %s", exc)
-                st.warning("⚠️ Could not fully analyze this video. Try a clearer angle or better lighting.")
+                st.warning("⚠️ Unable to process this video. Try a clearer recording.")
                 analysis = _fallback_analysis_result(
                     stage="unhandled",
                     message="Unable to analyze video properly",
@@ -1160,7 +1162,7 @@ def main() -> None:
                 if status in {"ok", "partial"}:
                     st.session_state.last_analysis = analysis
                 if status == "error":
-                    st.warning("⚠️ Could not fully analyze this video. Try a clearer angle or better lighting.")
+                    st.warning("⚠️ Unable to process this video. Try a clearer recording.")
                     st.info(str(analysis.get("message", "Unable to analyze video properly")))
 
         if st.session_state.last_analysis:
